@@ -16,6 +16,12 @@ chmod +x scripts/*.sh
 ```
 
 ### Running
+```shell
+./scripts/run.sh
+```
+
+### Data preparation
+See public_data/sample_scene.
 
 ## Citation
 
