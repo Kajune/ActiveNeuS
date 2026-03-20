@@ -151,10 +151,4 @@ crashlytics-build.properties
 fabric.properties
 
 data
-public_data
 exp
-exp_old
-tmp
-*.csv
-!scripts
-utils/raft_stereo/models/*
