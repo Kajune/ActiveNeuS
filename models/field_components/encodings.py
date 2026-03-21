@@ -18,7 +18,7 @@ Encoding functions
 
 import itertools
 from abc import abstractmethod
-from typing import Literal, Optional, Sequence, Callable
+from typing import Literal, Optional, Sequence
 
 import numpy as np
 import torch
@@ -210,19 +210,13 @@ class FFEncoding(Encoding):
         min_freq_exp: float,
         max_freq_exp: float,
         include_input: bool = False,
-        learnable_basis: bool = False,
-        transform: Callable = None,
     ) -> None:
         super().__init__(in_dim)
         self.num_frequencies = num_frequencies
         self.min_freq = min_freq_exp
         self.max_freq = max_freq_exp
-        if not learnable_basis:
-            self.register_buffer(name="b_matrix", tensor=basis)
-        else:
-            self.b_matrix = nn.Parameter(basis)
+        self.register_buffer(name="b_matrix", tensor=basis)
         self.include_input = include_input
-        self.transform = transform
 
     def get_out_dim(self) -> int:
         if self.in_dim is None:
@@ -248,18 +242,14 @@ class FFEncoding(Encoding):
         Returns:
             Output values will be between -1 and 1
         """
-#        scaled_in_tensor = 2 * torch.pi * in_tensor  # scale to [0, 2pi]
-        scaled_in_tensor = in_tensor
-        if self.transform is not None:
-            scaled_in_tensor = self.transform(scaled_in_tensor)
-        scaled_in_tensor = scaled_in_tensor @ self.b_matrix  # [..., "num_frequencies"]
+        scaled_in_tensor = 2 * torch.pi * in_tensor  # scale to [0, 2pi]
+        scaled_inputs = scaled_in_tensor @ self.b_matrix  # [..., "num_frequencies"]
         freqs = 2 ** torch.linspace(self.min_freq, self.max_freq, self.num_frequencies, device=in_tensor.device)
-        scaled_inputs = scaled_in_tensor[..., None, :] * freqs[..., None]  # [..., "input_dim", "num_scales"]
-#        scaled_inputs = scaled_inputs.view(*scaled_inputs.shape[:-2], -1)  # [..., "input_dim" * "num_scales"]
+        scaled_inputs = scaled_inputs[..., None] * freqs  # [..., "input_dim", "num_scales"]
+        scaled_inputs = scaled_inputs.view(*scaled_inputs.shape[:-2], -1)  # [..., "input_dim" * "num_scales"]
 
         if covs is None:
             encoded_inputs = torch.sin(torch.cat([scaled_inputs, scaled_inputs + torch.pi / 2.0], dim=-1))
-            encoded_inputs = encoded_inputs.view(*encoded_inputs.shape[:-2], -1)
         else:
             input_var = torch.sum((covs @ self.b_matrix) * self.b_matrix, -2)
             input_var = input_var[..., :, None] * freqs[None, :] ** 2

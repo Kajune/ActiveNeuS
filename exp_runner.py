@@ -1,7 +1,6 @@
 import os, sys, time, logging, argparse, json, glob, random
 import numpy as np
 import cv2
-import open3d as o3d
 import trimesh
 import torch
 import torch.nn as nn
@@ -11,9 +10,8 @@ from shutil import copyfile
 from tqdm import tqdm
 from pyhocon import ConfigFactory
 from models.dataset import Dataset
-from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF, MediumNeRF, ProjectionNetwork, ShadowField, DeformNetwork, DeformNetworkSiren
+from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF, MediumNeRF, ProjectionNetwork, ShadowField, DeformNetwork
 from models.renderer import NeuSRenderer
-from models.LLR import local_linear_reconstruction
 from camera_visualization import plot_camera_scene
 from pysdf import SDF
 from pytorch_msssim import ssim, ms_ssim, SSIM, MS_SSIM
@@ -30,9 +28,9 @@ def torch_fix_seed(seed=42):
 	torch.cuda.manual_seed(seed)
 	torch.backends.cudnn.deterministic = True
 	torch.use_deterministic_algorithms = True
-	torch.backends.cuda.matmul.allow_tf32 = True
-	torch.backends.cudnn.allow_tf32 = True
 
+
+torch_fix_seed()
 
 def recursive_overwrite(config, overwrite_config):
 	for k, v in overwrite_config.items():
@@ -46,20 +44,27 @@ def recursive_overwrite(config, overwrite_config):
 	return config
 
 
-def get_event_indices(indices, image_perm, event_mode):
+def get_event_ref_indices(indices, n_images, event_mode):
 	if event_mode == "sequential":
-		indices_prev = max(indices - 1, 0)
-		indices_next = indices
-
+		indices_ref = min(indices + 1, n_images - 1)
 	elif event_mode == "accumulated":
-		indices_prev = indices * 0
-		indices_next = indices
+		indices_ref = indices * 0
+	elif event_mode == "interval":
+		indices_ref = min(indices + 10, n_images - 1)
+	elif event_mode == "mixed":
+		indices_ref = min(indices + 1, n_images - 1)
 
-	elif event_mode == "random":
-		indices_prev = image_perm[torch.randint(len(image_perm), (1,))][0]
-		indices_next = indices
-
-	return indices_prev, indices_next
+		if isinstance(indices_ref, int):
+			if indices % 3 == 1:
+#				indices_ref = 0
+				indices_ref = min(indices + 5, n_images - 1)
+			elif indices % 3 == 2:
+				indices_ref = min(indices + 10, n_images - 1)
+		else:
+#			indices_ref[indices % 3 == 1] = 0
+			indices_ref[indices % 3 == 1] = (indices[indices % 3 == 1] + 5).clip(0, n_images - 1)
+			indices_ref[indices % 3 == 2] = (indices[indices % 3 == 2] + 10).clip(0, n_images - 1)
+	return indices_ref
 
 
 def remove_floaters(mesh, epsilon=0.01):
@@ -82,43 +87,36 @@ def is_json_serializable(value):
 class Runner:
 	def __init__(self, conf_path, mode='train', exp_name='default', case='CASE_NAME', 
 				load=None, load_metadata=None, load_params=None, resume=False, freeze=[],
-				estimate_cam_intrinsic=False, estimate_cam_pose=False, use_mlp_for_pose=False,
-				estimate_last_cam_pose=False, cam_noise={}, mask_ratio=1.0, 
-				estimate_proj_intrinsic=False, estimate_proj_pose=False, proj_noise={},
-				initial_illum_params=None, estimate_illumination=False, pattern_noise={}, 
+				estimate_pose=False, estimate_last_pose=False, pose_noise={}, mask_ratio=1.0, 
+				estimate_proj_pose=False, proj_pose_noise={},
+				initial_illum_params=None, estimate_illumination=False, 
+				estimate_pattern=False, pattern_noise={}, 
 				estimate_cam_refraction=False, cam_refractive_interface_params=None,
 				estimate_proj_refraction=False, proj_refractive_interface_params=None,
-				frame_weights=False, num_images=None, num_images_policy='interval', num_images_incremental=0, 
-				num_images_incremental_start=0, min_num_images=1,
+				num_images=None, num_images_incremental=0, num_images_incremental_start=0,
 				image_ind_offset=0, dynamic=False, end_iter=None, overwrite_params=None, 
 				pretrain_sdf_network=False, initial_shape_type="sphere", initial_shape_mesh=None,
-				event_mode=False, simulate_event=False, scene_scale=1.0, baseline_scale=1.0, profiling=None):
+				event_mode=False, scene_scale=1.0, profiling=None):
 		self.device = torch.device('cuda')
 		self.num_images = num_images
-		self.num_images_policy = num_images_policy
 		self.num_images_incremental = num_images_incremental
 		self.num_images_incremental_start = num_images_incremental_start
-		self.min_num_images = min_num_images
 		self.current_num_images = self.num_images
 		self.image_ind_offset = image_ind_offset
 		self.dynamic = dynamic
 		self.initial_illum_params = initial_illum_params
 		self.estimate_illumination = estimate_illumination
-		self.estimate_cam_intrinsic = estimate_cam_intrinsic
-		self.estimate_cam_pose = estimate_cam_pose
-		self.use_mlp_for_pose = use_mlp_for_pose
-		self.estimate_last_cam_pose = estimate_last_cam_pose
-		self.estimate_proj_intrinsic = estimate_proj_intrinsic
+		self.estimate_pose = estimate_pose
+		self.estimate_last_pose = estimate_last_pose
 		self.estimate_proj_pose = estimate_proj_pose
+		self.estimate_pattern = estimate_pattern
 		self.estimate_cam_refraction = estimate_cam_refraction
 		self.estimate_proj_refraction = estimate_proj_refraction
-		self.frame_weights = frame_weights
 		self.load = load
 		self.load_metadata = load_metadata
 		self.load_params = load_params
 		self.freeze = freeze
 		self.event_mode = event_mode
-		self.simulate_event = simulate_event
 		self.mask_ratio = mask_ratio
 		self.profiling = profiling
 
@@ -136,51 +134,34 @@ class Runner:
 
 		self.base_exp_dir = self.conf['general.base_exp_dir']
 		os.makedirs(self.base_exp_dir, exist_ok=True)
-		self.dataset = Dataset(self.conf['dataset'], cam_noise, proj_noise, pattern_noise, self.image_ind_offset,
+		self.dataset = Dataset(self.conf['dataset'], pose_noise, proj_pose_noise, pattern_noise, 
 							cam_refractive_interface_params, proj_refractive_interface_params, 
-							event_mode=self.event_mode, simulate_event=self.simulate_event, 
-							scene_scale=scene_scale, baseline_scale=baseline_scale, dynamic=self.dynamic,
-							use_cam_cache=(not self.estimate_cam_pose) and (not self.estimate_last_cam_pose) and (not self.estimate_cam_intrinsic),
-							use_proj_cache=(not self.estimate_proj_pose) and (not self.estimate_proj_intrinsic), 
-							estimate_cam_intrinsic=self.estimate_cam_intrinsic, estimate_cam_pose=self.estimate_cam_pose, 
-							estimate_proj_intrinsic=self.estimate_proj_intrinsic, estimate_proj_pose=self.estimate_proj_pose,
-							use_mlp_for_pose=use_mlp_for_pose)
+							event_mode=self.event_mode, scene_scale=scene_scale, dynamic=self.dynamic)
 		self.resume = resume
 		if self.resume and self.load is None:
 			self.load = self.base_exp_dir
 
 		if self.num_images is None:
 			self.num_images = self.dataset.n_images
-			self.current_num_images = self.num_images
 
 		self.conf['argparse'] = {
 			"num_images": self.num_images,
-			"num_images_policy": self.num_images_policy,
 			"num_images_incremental": self.num_images_incremental,
 			"num_images_incremental_start": self.num_images_incremental_start,
-			"min_num_images": self.min_num_images,
 			"image_ind_offset": self.image_ind_offset,
 			"dynamic": self.dynamic,
-			"cam_noise": cam_noise,
-			"proj_noise": proj_noise,
 			"initial_illum_params": self.initial_illum_params,
 			"estimate_illumination": self.estimate_illumination,
-			"estimate_cam_intrinsic": self.estimate_cam_intrinsic,
-			"estimate_cam_pose": self.estimate_cam_pose,
-			"use_mlp_for_pose": self.use_mlp_for_pose,
-			"estimate_last_cam_pose": self.estimate_last_cam_pose,
-			"estimate_proj_intrinsic": self.estimate_proj_intrinsic,
+			"estimate_pose": self.estimate_pose,
+			"estimate_last_pose": self.estimate_last_pose,
 			"estimate_proj_pose": self.estimate_proj_pose,
+			"estimate_pattern": self.estimate_pattern,
 			"estimate_cam_refraction": self.estimate_cam_refraction,
 			"estimate_proj_refraction": self.estimate_proj_refraction,
-			"frame_weights": self.frame_weights,
 			"load": self.load,
 			"load_metadata": self.load_metadata,
 			"load_params": self.load_params,
 			"event_mode": self.event_mode,
-			"simulate_event": self.simulate_event,
-			"scene_scale": scene_scale,
-			"baseline_scale": baseline_scale,
 			"mask_ratio": self.mask_ratio,
 		}
 
@@ -201,8 +182,6 @@ class Runner:
 		self.validate_resolution_level = self.conf.get_int('train.validate_resolution_level')
 		self.learning_rate = self.conf.get_float('train.learning_rate')
 		self.learning_rate_alpha = self.conf.get_float('train.learning_rate_alpha')
-		self.adaptive_lr = self.conf.get_float('train.adaptive_lr', default=None)
-		self.atten_end_iter = self.conf.get_int('train.atten_end_iter', default=self.end_iter)
 		self.use_white_bkgd = self.conf.get_bool('train.use_white_bkgd')
 		self.warm_up_end = self.conf.get_float('train.warm_up_end', default=0.0)
 		self.anneal_end = self.conf.get_float('train.anneal_end', default=0.0)
@@ -213,7 +192,6 @@ class Runner:
 		self.ray_sampling_mode = self.conf.get_string('train.ray_sampling_mode', default="sequential")
 		assert self.ray_sampling_mode == "sequential", "ray_sampling_mode must be sequential now."
 		self.multi_ray_sample_images = self.conf.get_int('train.multi_ray_sample_images', default=2)
-		self.cam_param_warm_up_strategy = self.conf.get_string('train.cam_param_warm_up_strategy', default=None)
 
 		# Weights
 		self.color_weight = self.conf.get_float('train.color_weight', default=1.0)
@@ -231,8 +209,6 @@ class Runner:
 		self.depth_weight_neg_begin = self.conf.get_float('train.depth_weight_neg_begin', default=0)
 		self.depth_weight_pos_end = self.conf.get_float('train.depth_weight_pos_end', default=0)
 		self.depth_weight_neg_end = self.conf.get_float('train.depth_weight_neg_end', default=0)
-		self.aruco_weight_begin = self.conf.get_float('train.aruco_weight_begin', default=0)
-		self.aruco_weight_end = self.conf.get_float('train.aruco_weight_end', default=0)
 		self.sparsity_reg_weight_begin = self.conf.get_float('train.sparsity_reg_weight_begin', default=0)
 		self.sparsity_reg_weight_end = self.conf.get_float('train.sparsity_reg_weight_end', default=0)
 		self.unimodality_loss_weight_begin = self.conf.get_float('train.unimodality_loss_weight_begin', default=0)
@@ -240,10 +216,7 @@ class Runner:
 		self.smoothness_weight = self.conf.get_float('train.smoothness_weight', default=0)
 		self.density_L1_weight = self.conf.get_float('train.density_L1_weight', default=0)
 		self.shadow_field_weight = self.conf.get_float('train.shadow_field_weight', default=0)
-		self.reverse_rendering_weight_begin = self.conf.get_float('train.reverse_rendering_weight_begin', default=0)
-		self.reverse_rendering_weight_end = self.conf.get_float('train.reverse_rendering_weight_end', default=0)
-		self.llr_weight = self.conf.get_float('train.llr_weight', default=0)
-
+		self.student_weight = self.conf.get_float('train.student', default=1.0)
 		self.mode = mode
 		self.model_list = []
 		self.writer = None
@@ -256,28 +229,27 @@ class Runner:
 		if self.depth_weight_pos_begin > 0 or self.depth_weight_pos_end > 0 or \
 			self.depth_weight_neg_begin > 0 or self.depth_weight_neg_end > 0:
 			point_cloud = trimesh.load(os.path.join(os.path.join("public_data", case, "points3d.ply")))
-			point_cloud.apply_transform(np.linalg.inv(self.dataset.scale_mat.cpu().detach().numpy()))
+			point_cloud.apply_transform(np.linalg.inv(self.dataset.camera_params.scale_mats_np[0]))
 			vertices = point_cloud.vertices
 			indices = np.random.choice(np.arange(len(vertices)), 10000, replace=False)
-			self.point_cloud_pos = torch.from_numpy(vertices[indices]).to(self.device).float()
+			self.point_cloud_pos = torch.from_numpy(vertices[indices]).to(self.device)
 
-		self.point_cloud_neg = torch.from_numpy(np.random.uniform(-1,1,(10000,3))).float().to(self.device)
+		self.point_cloud_neg = torch.from_numpy(np.random.uniform(-1,1,(10000,3))).to(self.device)
 		if self.depth_weight_neg_begin > 0 or self.depth_weight_neg_end > 0:
 			knn = NearestNeighbors(n_neighbors=1)
 			knn.fit(self.point_cloud_pos.cpu().numpy())
 			distances, indices = knn.kneighbors(self.point_cloud_neg.cpu().numpy())
 			distances = distances.flatten()
-			self.point_cloud_neg_distances = torch.from_numpy(distances).to(self.device).float()
+			self.point_cloud_neg_distances = torch.from_numpy(distances).to(self.device)
 
 		# Backup codes and configs for debug
 		if self.mode[:5] == 'train':
 			self.file_backup()
 
-		self.image_perm = self.get_image_perm()
-
 
 	def initialize_network(self):
 		self.iter_step = 0
+		self.initial_s_val = None
 
 		# Networks
 		params_to_train = []
@@ -302,19 +274,13 @@ class Runner:
 			params_to_train += list(self.color_network.parameters())
 
 		if self.dataset.with_projection:
-			params_to_train += list(self.dataset.projection_pattern.parameters())
-
 			if self.estimate_illumination:
 				params_to_train += list(self.dataset.illumination_params.parameters())
 	
 			if self.initial_illum_params is not None:
 				nn.init.constant_(self.dataset.illumination_params.ambient, self.initial_illum_params["ambient"])
-				nn.init.constant_(self.dataset.illumination_params.diffuse_denom, 1 / self.initial_illum_params["diffuse"])
-				nn.init.constant_(self.dataset.illumination_params.emissive_denom, 1 / self.initial_illum_params["emissive"])
-
-			if self.estimate_proj_pose or self.estimate_proj_intrinsic:
-				self.conf['model.projection_network']['no_grad'] = False
-				print("Overwriting model.projection_network.no_grad to estimate projector poses.")
+				nn.init.constant_(self.dataset.illumination_params.diffuse, self.initial_illum_params["diffuse"])
+				nn.init.constant_(self.dataset.illumination_params.emissive, self.initial_illum_params["emissive"])
 
 			self.projection_network = ProjectionNetwork(**self.conf['model.projection_network'], n_images=self.dataset.n_images).to(self.device)
 			params_to_train += list(self.projection_network.parameters())
@@ -327,16 +293,16 @@ class Runner:
 			self.deform_network = DeformNetwork(**self.conf['model.deform_network']).to(self.device)
 			params_to_train += list(self.deform_network.parameters())
 
-		if self.estimate_cam_pose or self.estimate_last_cam_pose or self.estimate_cam_intrinsic:
+		if self.estimate_pose or self.estimate_last_pose:
 			params_to_train += list(self.dataset.camera_params.parameters())
-		if self.estimate_proj_pose or self.estimate_proj_intrinsic:
+		if self.estimate_proj_pose:
 			params_to_train += list(self.dataset.projector_params.parameters())
+		if self.estimate_pattern:
+			params_to_train += list(self.dataset.projection_pattern.parameters())
 		if self.dataset.with_cam_refraction and self.estimate_cam_refraction:
 			params_to_train += list(self.dataset.cam_refractive_interface.parameters())
 		if self.dataset.with_proj_refraction and self.estimate_proj_refraction:
 			params_to_train += list(self.dataset.proj_refractive_interface.parameters())
-		if self.frame_weights:
-			params_to_train += list(self.dataset.frame_weights.parameters())
 
 		self.optimizer = torch.optim.AdamW(params_to_train, lr=self.learning_rate)
 
@@ -391,33 +357,17 @@ class Runner:
 			self.pretrain()
 
 
-	def event_camera_model(self, img_prev, img_next):
-		is_numpy = isinstance(img_prev, np.ndarray)
-		if is_numpy:
-			img_prev = torch.from_numpy(img_prev)
-			img_next = torch.from_numpy(img_next)
-
-		img_prev = img_prev.float()
-		img_next = img_next.float()
-
-		out = ((img_next.mean(dim=-1, keepdim=True).clamp(0, 1)
-		        - img_prev.mean(dim=-1, keepdim=True).clamp(0, 1))
-		       * self.dataset.event_scale + self.dataset.event_offset).clamp(0, 1)
-
-		if is_numpy:
-			out = out.numpy()
-
-		return out
+	def event_camera_model(self, img1, img2):
+		return ((img1.mean(dim=-1, keepdim=True).clamp(0, 1) - img2.mean(dim=-1, keepdim=True).clamp(0, 1)) * 0.5 + 0.5).clamp(0, 1)
 
 
-	def render_random_rays_impl(self, indices, curv_weight, pixels=None, mode="cam"):
+	def render_random_rays_impl(self, indices, curv_weight, pixels=None):
 		if self.ray_sampling_mode == "sequential":
-			data = self.dataset.gen_random_rays_at(indices, self.batch_size * (2 if self.iter_step < self.shadow_field_begin else 1), pixels=pixels, mode=mode)
+			data = self.dataset.gen_random_rays_at(indices, self.batch_size * (2 if self.iter_step < self.shadow_field_begin else 1), pixels=pixels)
 		else:
-			indices, data = self.dataset.gen_random_rays_multi(indices, self.batch_size * (2 if self.iter_step < self.shadow_field_begin else 1), pixels=pixels, mode=mode)
+			indices, data = self.dataset.gen_random_rays_multi(indices, self.batch_size * (2 if self.iter_step < self.shadow_field_begin else 1), pixels=pixels)
 
-		if not (self.estimate_proj_pose or self.estimate_proj_intrinsic or self.estimate_cam_pose or self.estimate_cam_intrinsic) or \
-			(self.estimate_last_cam_pose and indices != self.current_num_images - 1) or indices == self.image_ind_offset:
+		if not self.estimate_proj_pose and not self.estimate_pose and (self.estimate_last_pose and indices == self.current_num_images - 1):
 			data = data.detach()
 		rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
 		near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
@@ -434,13 +384,13 @@ class Runner:
 		mask = torch.ones_like(mask) * (1 - self.mask_ratio) + mask * self.mask_ratio
 
 		if self.dataset.with_projection:
-			proj_params = self.dataset.get_proj_params(indices, mode)
-			illum_params = self.dataset.illumination_params(indices)
+			proj_params = self.dataset.get_proj_params(indices)
+			illum_params = self.dataset.illumination_params()
 		else:
 			proj_params = []
 			illum_params = None
 
-		render_out = self.renderer.render(rays_o, rays_d, indices - self.image_ind_offset, near, far,
+		render_out = self.renderer.render(rays_o, rays_d, indices, near, far,
 										  background_rgb=background_rgb,
 										  cos_anneal_ratio=self.get_cos_anneal_ratio(),
 										  proj_params=proj_params,
@@ -448,50 +398,28 @@ class Runner:
 										  compute_curvature_loss=curv_weight>0 and np.random.rand() < self.curv_sample_ratio,
 										  compute_temporal_smoothness_error=self.temporal_smoothness_weight>0,
 										  shadow_field_ratio=self.shadow_field_ratio,
-										  disable_shadow=self.iter_step<self.shadow_field_begin,
-										  mode=mode)
+										  disable_shadow=self.iter_step<self.shadow_field_begin)
 		return render_out, true_rgb, mask
 
 
-	def render_random_rays(self, indices, curv_weight, mode='cam', return_pixels=False):
-		pixels = self.dataset.gen_random_pixels(self.batch_size * (2 if self.iter_step < self.shadow_field_begin else 1), mode=mode)
-
+	def render_random_rays(self, indices, curv_weight):
 		if self.event_mode is not None:
-			indices_prev, indices_next = get_event_indices(indices, self.image_perm, self.event_mode)
-			render_out_next, true_event_next, mask_next = self.render_random_rays_impl(indices_next, curv_weight, pixels=pixels, mode=mode)
-			render_out_prev, true_event_prev, mask_prev = self.render_random_rays_impl(indices_prev, 0,           pixels=pixels, mode=mode)
-			render_out_next['color_fine'] = self.event_camera_model(render_out_prev['color_fine'], render_out_next['color_fine'])
-			if self.event_mode == "sequential":
-				true_event = true_event_next
-			else:
-				true_event = self.event_camera_model(true_event_prev, true_event_next)
+			indices_ref = get_event_ref_indices(indices, self.dataset.n_images, self.event_mode)
+			pixels = self.dataset.gen_random_pixels(self.batch_size * (2 if self.iter_step < self.shadow_field_begin else 1))
+			render_out, true_rgb, mask = self.render_random_rays_impl(indices, curv_weight, pixels=pixels)
+			render_out_ref, _, _ = self.render_random_rays_impl(indices_ref, 0, pixels=pixels)
+			render_out['color_fine'] = self.event_camera_model(render_out_ref['color_fine'], render_out['color_fine'])
 
-			"""
-			valid_pixels = mask_next & mask_prev
-			depth_next = render_out_next['depth'][valid_pixels]
-			depth_prev = render_out_prev['depth'][valid_pixels]
-			delta_depth = depth_next - depth_prev
-
-			flow_speed = []
-			for next_coord, prev_coord in zip(render_out_next['reprojection_coords'], render_out_prev['reprojection_coords']):
-				flow_speed.append(torch.norm(next_coord - prev_coord, p=2))
-			"""
-
-			ret = (render_out_next, true_event.mean(dim=-1, keepdim=True), mask_next.mean(dim=-1, keepdim=True))
+			return render_out, true_rgb.mean(dim=-1, keepdim=True), mask.mean(dim=-1, keepdim=True)
 
 		else:
-			ret = self.render_random_rays_impl(indices, curv_weight, mode=mode, pixels=pixels)
-
-		if return_pixels:
-			ret = (*ret, pixels)
-
-		return ret
+			return self.render_random_rays_impl(indices, curv_weight)
 
 
 	def pretrain(self):
 		# Make initial shape
 		if self.initial_shape_type == "plane":
-			cam_poses = torch.stack([self.dataset.camera_params.get_pose(i) for i in range(0,self.dataset.n_images)])
+			cam_poses = torch.stack([self.dataset.camera_params.get_cam_pose_inv(i) for i in range(0,self.dataset.n_images)])
 			tvecs = cam_poses[:,:3,3]
 			min_z = tvecs[...,2].min()
 			margin = 0.1
@@ -503,7 +431,7 @@ class Runner:
 			initial_shape = initial_shape.apply_transform(trans)
 
 		elif self.initial_shape_type == "tunnel":
-			cam_poses = torch.stack([self.dataset.camera_params.get_pose(i) for i in range(0,self.dataset.n_images)])
+			cam_poses = torch.stack([self.dataset.camera_params.get_cam_pose_inv(i) for i in range(0,self.dataset.n_images)])
 			tvecs = cam_poses[:,:3,3]
 
 			initial_shape = trimesh.creation.box(extents=[2, 2, 2])
@@ -519,7 +447,7 @@ class Runner:
 		elif self.initial_shape_type == "mesh":
 			assert self.initial_shape_mesh is not None
 			initial_shape = trimesh.load(self.initial_shape_mesh)
-			initial_shape.apply_transform(np.linalg.inv(self.dataset.scale_mat.cpu().detach().numpy()))
+			initial_shape.apply_transform(np.linalg.inv(self.dataset.camera_params.scale_mats_np[0]))
 
 		else:
 			print("Unknown initial shape type:", self.initial_shape_type)
@@ -529,7 +457,7 @@ class Runner:
 		initial_shape.export(os.path.join(self.base_exp_dir, 'meshes', 'initial_shape.ply'))
 
 		sdf_fn = SDF(initial_shape.vertices, initial_shape.faces)
-		self.image_perm = self.get_image_perm()
+		image_perm = self.get_image_perm()
 
 		# Pretrain SDF network
 		self.sdf_network.train()
@@ -539,14 +467,14 @@ class Runner:
 #			inputs = inputs.to(self.device)
 
 			if self.ray_sampling_mode == "sequential":
-				image_indices = self.image_perm[self.iter_step % len(self.image_perm)]
+				image_indices = image_perm[self.iter_step % len(image_perm)]
 			elif self.ray_sampling_mode == "random":
-				image_indices = torch.stack([self.image_perm[i] for i in np.random.randint(0, len(self.image_perm), size=(self.multi_ray_sample_images,))])
+				image_indices = torch.stack([image_perm[i] for i in np.random.randint(0, len(image_perm), size=(self.multi_ray_sample_images,))])
 			elif self.ray_sampling_mode == "consecutive":
 				img_idx = np.random.randint(0, self.dataset.n_images - self.multi_ray_sample_images)
-				image_indices = torch.from_numpy(np.int64([img_idx + i for i in range(self.multi_ray_sample_images)])).to(self.image_perm)
+				image_indices = torch.from_numpy(np.int64([img_idx + i for i in range(self.multi_ray_sample_images)])).to(image_perm)
 			elif self.ray_sampling_mode == "all":
-				image_indices = self.image_perm
+				image_indices = image_perm
 			else:
 				raise NotImplementedError
 
@@ -555,7 +483,7 @@ class Runner:
 			mask_sum = mask.sum() + 1e-5
 
 			color_fine = ret_fine['color_fine']
-			color_fine_loss = self.color_error(color_fine, true_rgb, mask, mask_sum).sum()
+			color_fine_loss = self.color_error(color_fine, true_rgb, mask, mask_sum)
 
 			gt_sdf = torch.from_numpy(-sdf_fn(ret_fine['pts'].cpu().detach().numpy())).to(self.device)
 			sdf_error = F.l1_loss(ret_fine['sdf'], gt_sdf[...,None].detach())
@@ -564,7 +492,7 @@ class Runner:
 			loss = color_fine_loss + sdf_error + gradient_error * self.igr_weight_begin
 
 			if i % 1000 == 0:
-				print("Pretrain loss: %f, color: %f, sdf: %f, grad: %f" % (loss.item(), color_fine_loss.item(), sdf_error.item(), gradient_error.item()))
+				print("Pretrain loss:", loss.item())
 			optimizer.zero_grad()
 			loss.backward()
 			optimizer.step()
@@ -597,24 +525,17 @@ class Runner:
 		self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
 		self.update_learning_rate()
 		res_step = self.end_iter - self.iter_step
-		self.image_perm = self.get_image_perm()
+		image_perm = self.get_image_perm()
 
-		self.loss_history = []
+		color_loss_history = []
 
-		if self.estimate_cam_pose or self.estimate_last_cam_pose:
+		if self.estimate_pose or self.estimate_last_pose:
 			self.validate_cam_pose()
+		if self.projection_network is not None:
+			if self.estimate_pattern or self.projection_network.pattern_conv is not None:
+				self.validate_pattern()
 		if self.estimate_proj_pose:
 			self.validate_proj_pose()
-
-#		self.validate_image()
-#		self.validate_mesh(time=self.image_ind_offset)
-
-		if self.aruco_weight_begin > 0 or self.aruco_weight_end > 0:
-			pts = self.dataset.aruco_points_at(self.image_ind_offset, scale=False).cpu().detach().numpy()
-			pcd = o3d.geometry.PointCloud()
-			pcd.points = o3d.utility.Vector3dVector(pts)
-			os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
-			o3d.io.write_point_cloud(os.path.join(self.base_exp_dir, "meshes", "aruco_points.ply"), pcd)
 
 		if self.profiling is not None:
 			prof = profile(
@@ -628,27 +549,26 @@ class Runner:
 		for iter_i in tqdm(range(res_step)):
 			if self.profiling is not None and iter_i == 1:
 				prof.start()
-			alpha = min(self.iter_step / (self.anneal_end + 1e-6), 1)
+			alpha = min(self.iter_step / self.anneal_end, 1)
 			igr_weight = alpha * self.igr_weight_end + (1 - alpha) * self.igr_weight_begin
 			curv_weight = alpha * self.curv_weight_end + (1 - alpha) * self.curv_weight_begin
 			mask_weight = alpha * self.mask_weight_end + (1 - alpha) * self.mask_weight_begin
 			sparsity_reg_weight = alpha * self.sparsity_reg_weight_end + (1 - alpha) * self.sparsity_reg_weight_begin
 			unimodality_loss_weight = alpha * self.unimodality_loss_weight_end + (1 - alpha) * self.unimodality_loss_weight_begin
-			reverse_rendering_weight = alpha * self.reverse_rendering_weight_end + (1 - alpha) * self.sparsity_reg_weight_begin
 
 			if self.ray_sampling_mode == "sequential":
-				image_indices = self.image_perm[self.iter_step % len(self.image_perm)]
+				image_indices = image_perm[self.iter_step % len(image_perm)]
 			elif self.ray_sampling_mode == "random":
-				image_indices = torch.stack([self.image_perm[i] for i in np.random.randint(0, len(self.image_perm), size=(self.multi_ray_sample_images,))])
+				image_indices = torch.stack([image_perm[i] for i in np.random.randint(0, len(image_perm), size=(self.multi_ray_sample_images,))])
 			elif self.ray_sampling_mode == "consecutive":
 				img_idx = np.random.randint(0, self.dataset.n_images - self.multi_ray_sample_images)
-				image_indices = torch.from_numpy(np.int64([img_idx + i for i in range(self.multi_ray_sample_images)])).to(self.image_perm)
+				image_indices = torch.from_numpy(np.int64([img_idx + i for i in range(self.multi_ray_sample_images)])).to(image_perm)
 			elif self.ray_sampling_mode == "all":
-				image_indices = self.image_perm
+				image_indices = image_perm
 			else:
 				raise NotImplementedError
 
-			render_out, true_rgb, mask, pixels = self.render_random_rays(image_indices, curv_weight, return_pixels=True)
+			render_out, true_rgb, mask = self.render_random_rays(image_indices, curv_weight)
 #			if self.event_mode is not None:
 #				mask = torch.isclose(true_rgb - 0.5, torch.zeros_like(true_rgb)).float() * 0.9 + 0.1
 			mask_sum = mask.sum() + 1e-5
@@ -690,43 +610,22 @@ class Runner:
 
 
 			if self.depth_weight_pos > 0:
-				depth_loss_pos = self.sdf_network.sdf(self.point_cloud_pos, time=image_indices).abs().mean()
+				depth_loss_pos = self.sdf_network.sdf(self.point_cloud_pos).abs().mean()
 			else:
 				depth_loss_pos = 0
 
 			if self.depth_weight_neg > 0:
-				depth_loss_neg = (self.sdf_network.sdf(self.point_cloud_neg, time=image_indices).abs() - self.point_cloud_neg_distances).abs().mean()
+				depth_loss_neg = (self.sdf_network.sdf(self.point_cloud_neg).abs() - self.point_cloud_neg_distances).abs().mean()
 #				depth_loss_neg = torch.exp(-1e2 * torch.abs(self.sdf_network.sdf(self.point_cloud_neg))).mean()
 			else:
 				depth_loss_neg = 0
 
-			if self.aruco_weight > 0:
-				aruco_loss = self.sdf_network.sdf(self.renderer.to_timed_pts(self.dataset.aruco_points_at(image_indices), image_indices), time=image_indices).abs().mean()
-			else:
-				aruco_loss = 0
-
 			if sparsity_reg_weight > 0:
-				sparsity_loss = torch.exp(-1e2 * torch.abs(self.sdf_network.sdf(self.renderer.to_timed_pts(self.point_cloud_neg, image_indices), time=image_indices))).mean()
+				sparsity_loss = torch.exp(-1e2 * torch.abs(self.sdf_network.sdf(self.point_cloud_neg, time=0))).mean()
 			else:
 				sparsity_loss = 0
 
-			if reverse_rendering_weight > 0:
-				render_out_reverse, true_rgb_reverse, _ = self.render_random_rays(image_indices, 0.0, mode='proj')
-				mask_reverse = render_out_reverse["weight_sum"].detach()
-				reverse_rendering_loss = self.color_error(render_out_reverse["color_fine"], true_rgb_reverse, mask_reverse, mask_reverse.sum() + 1e-5).sum()
-			else:
-				reverse_rendering_loss = 0
-
-			if self.llr_weight > 0 and self.deform_network is not None:
-				deformed_points = self.renderer.to_timed_pts(self.point_cloud_neg, image_indices)
-				llr_loss = local_linear_reconstruction(self.point_cloud_neg, deformed_points, n_neighbors=30)
-			else:
-				llr_loss = 0
-
-			# something wrong
-#			frame_weight = self.dataset.get_frame_weight(image_indices, pixels)
-
-			loss = (color_fine_loss).sum() * self.color_weight +\
+			loss = color_fine_loss.sum() * self.color_weight +\
 				   eikonal_loss * igr_weight +\
 				   curvature_loss * curv_weight / self.curv_sample_ratio +\
 				   temporal_smoothness_loss * self.temporal_smoothness_weight +\
@@ -735,76 +634,60 @@ class Runner:
 				   shadow_field_loss * self.shadow_field_weight +\
 				   depth_loss_pos * self.depth_weight_pos +\
 				   depth_loss_neg * self.depth_weight_neg +\
-				   aruco_loss * self.aruco_weight +\
 				   sparsity_loss * sparsity_reg_weight +\
-				   unimodality_loss * unimodality_loss_weight +\
-				   reverse_rendering_loss * reverse_rendering_weight +\
-				   llr_loss * self.llr_weight
+				   unimodality_loss * unimodality_loss_weight
+
+			if "student_error" in render_out:
+				student_error = render_out['student_error']
+				loss += student_error * self.student_weight
+			else:
+				student_error = 0
 
 			self.optimizer.zero_grad()
 			loss.backward()
 
-			if self.estimate_cam_pose or self.estimate_cam_intrinsic:
+			if self.estimate_pose:
 				for param in self.dataset.camera_params.parameters():
-					if (self.estimate_last_cam_pose and image_indices != self.current_num_images - 1) or \
-						image_indices == self.image_ind_offset:
-						param.grad = None
-					elif self.iter_step < self.warm_up_end and self.cam_param_warm_up_strategy is not None:
-						if self.cam_param_warm_up_strategy == "step":
-							param.grad = None
-						elif self.cam_param_warm_up_strategy == "linear":
-							param.grad *= self.iter_step / self.warm_up_end
-						else:
-							raise NotImplementedError
-
-			if self.estimate_proj_pose or self.estimate_proj_intrinsic:
-				for param in self.dataset.projector_params.parameters():
 					if self.iter_step < self.warm_up_end:
-						param.grad = None
+						param.grad *= 0.0
+
+#			if self.estimate_proj_pose:
+#				for param in self.dataset.projector_params.parameters():
+#					if self.iter_step < self.warm_up_end:
+#						param.grad *= 0.0
 
 			if self.estimate_illumination:
 				if self.iter_step < self.warm_up_end:
 					for param in self.dataset.illumination_params.parameters():
-						param.grad = None
+						param.grad *= 0
 
 			if self.estimate_proj_refraction:
 				if self.iter_step < self.warm_up_end:
 					for param in self.dataset.proj_refractive_interface.parameters():
-						param.grad = None
+						param.grad *= 0
 
 			self.optimizer.step()
 
 			self.iter_step += 1
 
+			self.writer.add_scalar('Loss/loss', loss, self.iter_step)
+			self.writer.add_scalar('Loss/color_loss', color_fine_loss.sum(), self.iter_step)
+			self.writer.add_scalar('Loss/mask_loss', mask_loss, self.iter_step)
+			self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
+			self.writer.add_scalar('Loss/curvature_loss', curvature_loss, self.iter_step)
+			self.writer.add_scalar('Loss/shadow_field_loss', shadow_field_loss, self.iter_step)
+			self.writer.add_scalar('Loss/depth_loss_pos', depth_loss_pos, self.iter_step)
+			self.writer.add_scalar('Loss/depth_loss_neg', depth_loss_neg, self.iter_step)
+			self.writer.add_scalar('Loss/student_loss', student_error, self.iter_step)
+			self.writer.add_scalar('Loss/sparsity_loss', sparsity_loss, self.iter_step)
+			self.writer.add_scalar('Loss/temporal_smoothness_loss', temporal_smoothness_loss, self.iter_step)
+			self.writer.add_scalar('Loss/unimodality_loss', unimodality_loss, self.iter_step)
+			self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
+			self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
+			self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
+			self.writer.add_scalar('Incremental/current_num_images', self.current_num_images, self.iter_step)
+
 			if self.iter_step % self.report_freq == 0:
-				with torch.no_grad():
-					self.writer.add_scalar('Loss/loss', loss, self.iter_step)
-					self.writer.add_scalar('Loss/color_loss', color_fine_loss.sum(), self.iter_step)
-					self.writer.add_scalar('Loss/mask_loss', mask_loss, self.iter_step)
-					self.writer.add_scalar('Loss/eikonal_loss', eikonal_loss, self.iter_step)
-					self.writer.add_scalar('Loss/curvature_loss', curvature_loss, self.iter_step)
-					self.writer.add_scalar('Loss/shadow_field_loss', shadow_field_loss, self.iter_step)
-					self.writer.add_scalar('Loss/depth_loss_pos', depth_loss_pos, self.iter_step)
-					self.writer.add_scalar('Loss/depth_loss_neg', depth_loss_neg, self.iter_step)
-					self.writer.add_scalar('Loss/aruco_loss', aruco_loss, self.iter_step)
-					self.writer.add_scalar('Loss/sparsity_loss', sparsity_loss, self.iter_step)
-					self.writer.add_scalar('Loss/temporal_smoothness_loss', temporal_smoothness_loss, self.iter_step)
-					self.writer.add_scalar('Loss/unimodality_loss', unimodality_loss, self.iter_step)
-					self.writer.add_scalar('Loss/reverse_rendering_loss', reverse_rendering_loss, self.iter_step)
-					self.writer.add_scalar('Loss/llr_loss', llr_loss, self.iter_step)
-
-					self.writer.add_scalar('Statistics/s_val', s_val.mean(), self.iter_step)
-					self.writer.add_scalar('Statistics/weight_max', (weight_max * mask).sum() / mask_sum, self.iter_step)
-					self.writer.add_scalar('Statistics/psnr', psnr, self.iter_step)
-					self.writer.add_scalar('Statistics/current_num_images', self.current_num_images, self.iter_step)
-					self.writer.add_scalar('Statistics/learning_factor', self.learning_factor, self.iter_step)
-					self.writer.add_scalar('Statistics/learning_rate', self.learning_factor * self.learning_rate, self.iter_step)
-
-					if self.projection_network is not None and self.projection_network.rot_sigma is not None:
-						self.writer.add_scalar('Statistics/proj_rot_sigma', self.projection_network.rot_sigma.mean(), self.iter_step)
-
-				self.loss_history.append(loss.item())
-
 				print('iter:{:8>d} loss = {} lr={} psnr={},'.format(
 					self.iter_step, loss, self.optimizer.param_groups[0]['lr'], psnr))
 
@@ -814,8 +697,10 @@ class Runner:
 			if self.iter_step % self.val_freq == 0:
 				self.renderer.eval()
 				self.validate_image()
-				if self.estimate_cam_pose or self.estimate_last_cam_pose:
+				if self.estimate_pose or self.estimate_last_pose:
 					self.validate_cam_pose()
+				if self.estimate_pattern:
+					self.validate_pattern()
 				if self.estimate_proj_pose:
 					self.validate_proj_pose()
 #				if self.shadow_field_weight > 0:
@@ -833,8 +718,13 @@ class Runner:
 
 			self.update_learning_rate()
 
-			if self.iter_step % len(self.image_perm) == 0:
-				self.image_perm = self.get_image_perm()
+			if self.iter_step % len(image_perm) == 0:
+				image_perm = self.get_image_perm()
+
+			if self.initial_s_val is None:
+				self.initial_s_val = s_val.mean().item()
+				self.min_s_val = self.initial_s_val
+			self.min_s_val = min(self.min_s_val, s_val.mean().item())
 
 		if self.profiling is not None:
 			prof.stop()
@@ -844,28 +734,14 @@ class Runner:
 
 	def get_image_perm(self):
 		n_images = self.dataset.n_images
-
 		if self.num_images is None:
 			perm = torch.randperm(n_images)
-			self.current_num_images = num_images
 		else:
 			if self.num_images_incremental > 0:
-				self.current_num_images = min(
-					max(
-						int(np.ceil(max(self.iter_step - self.num_images_incremental_start, 0) / self.num_images_incremental)) + 1,
-						self.min_num_images,
-					),
-					self.num_images
-				)
+				self.current_num_images = min(max(self.iter_step - self.num_images_incremental_start, 0) // self.num_images_incremental + 1, self.num_images)
 				perm = torch.randperm(self.current_num_images) + self.image_ind_offset
 			else:
-				if self.num_images_policy == "interval":
-					perm = torch.randperm(self.num_images) * (n_images - self.image_ind_offset) // self.num_images + self.image_ind_offset
-				elif self.num_images_policy == "first":
-					perm = torch.randperm(self.num_images) + self.image_ind_offset
-				else:
-					raise NotImplementedError
-
+				perm = torch.randperm(self.num_images) * n_images // self.num_images + self.image_ind_offset
 		return perm
 
 	def get_cos_anneal_ratio(self):
@@ -876,22 +752,17 @@ class Runner:
 
 	def update_learning_rate(self):
 		if self.iter_step < self.warm_up_end:
-			self.learning_factor = self.iter_step / self.warm_up_end
+			learning_factor = self.iter_step / self.warm_up_end
 		else:
-			if self.adaptive_lr is not None and len(self.loss_history) >= 2:
-				alpha = min((1 - min(self.loss_history[-1] / self.loss_history[-2], 1)) / self.adaptive_lr, 1)
-				self.learning_factor = alpha + self.learning_rate_alpha
-			else:
-				alpha = self.learning_rate_alpha
-				progress = min((self.iter_step - self.warm_up_end) / (self.atten_end_iter - self.warm_up_end + 1e-3), 1)
-				self.learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
+			alpha = self.learning_rate_alpha
+			progress = (self.iter_step - self.warm_up_end) / (self.end_iter - self.warm_up_end + 1e-3)
+			learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
 
 		for g in self.optimizer.param_groups:
-			g['lr'] = self.learning_rate * self.learning_factor
+			g['lr'] = self.learning_rate * learning_factor
 
 		self.depth_weight_pos = (self.depth_weight_pos_end - self.depth_weight_pos_begin) * (self.iter_step / self.end_iter) + self.depth_weight_pos_begin
 		self.depth_weight_neg = (self.depth_weight_neg_end - self.depth_weight_neg_begin) * (self.iter_step / self.end_iter) + self.depth_weight_neg_begin
-		self.aruco_weight = (self.aruco_weight_end - self.aruco_weight_begin) * (self.iter_step / self.end_iter) + self.aruco_weight_begin
 
 #		self.shadow_field_ratio = np.clip((self.iter_step - self.shadow_field_begin) / (self.shadow_field_end - self.shadow_field_begin + 1e-3), 0, 1)
 #		self.shadow_field_ratio = 1.0
@@ -915,23 +786,23 @@ class Runner:
 		copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
 	def load_checkpoint(self, checkpoint_name, metadata_only=False, params_only=False):
-		checkpoint = torch.load(checkpoint_name, map_location=self.device, weights_only=False)
+		checkpoint = torch.load(checkpoint_name, map_location=self.device)
 		if not metadata_only:
-			self.nerf_outside.load_state_dict(checkpoint['nerf'], strict=False)
-			self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'], strict=False)
-			self.deviation_network.load_state_dict(checkpoint['variance_network_fine'], strict=False)
-			self.color_network.load_state_dict(checkpoint['color_network_fine'], strict=False)
+			self.nerf_outside.load_state_dict(checkpoint['nerf'])
+			self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
+			self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
+			self.color_network.load_state_dict(checkpoint['color_network_fine'])
 
 			if self.deform_network is not None:
-				self.deform_network.load_state_dict(checkpoint['deform_network'], strict=False)
+				self.deform_network.load_state_dict(checkpoint['deform_network'])
 
 			if self.dataset.with_projection and 'projection_network' in checkpoint:
-				self.projection_network.load_state_dict(checkpoint['projection_network'], strict=False)
+				self.projection_network.load_state_dict(checkpoint['projection_network'])
 
 				if 'shadow_field' in checkpoint:
-					self.shadow_field.load_state_dict(checkpoint['shadow_field'], strict=False)
+					self.shadow_field.load_state_dict(checkpoint['shadow_field'])
 				if 'illumination_params' in checkpoint:
-					self.dataset.illumination_params.load_state_dict(checkpoint['illumination_params'], strict=False)
+					self.dataset.illumination_params.load_state_dict(checkpoint['illumination_params'])
 
 			try:
 				self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -941,18 +812,18 @@ class Runner:
 
 		if not params_only:
 			if 'camera_params' in checkpoint:
-				self.dataset.camera_params.load_state_dict(checkpoint['camera_params'], strict=False)
+				self.dataset.camera_params.load_state_dict(checkpoint['camera_params'])
 
 			if self.dataset.with_projection:
 				if 'projector_params' in checkpoint:
-					self.dataset.projector_params.load_state_dict(checkpoint['projector_params'], strict=False)
+					self.dataset.projector_params.load_state_dict(checkpoint['projector_params'])
 				if 'projection_pattern' in checkpoint:
-					self.dataset.projection_pattern.load_state_dict(checkpoint['projection_pattern'], strict=False)
+					self.dataset.projection_pattern.load_state_dict(checkpoint['projection_pattern'])
 
 			if 'cam_refractive_interface' in checkpoint:
-				self.dataset.cam_refractive_interface.load_state_dict(checkpoint['cam_refractive_interface'], strict=False)
+				self.dataset.cam_refractive_interface.load_state_dict(checkpoint['cam_refractive_interface'])
 			if 'proj_refractive_interface' in checkpoint:
-				self.dataset.proj_refractive_interface.load_state_dict(checkpoint['proj_refractive_interface'], strict=False)
+				self.dataset.proj_refractive_interface.load_state_dict(checkpoint['proj_refractive_interface'])
 
 		self.update_learning_rate()
 		logging.info('End')
@@ -995,11 +866,10 @@ class Runner:
 		torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
 
 
-	def render_image_core(self, idx, rays_o, rays_d, true_rgb, proj_params, illum_params, visualize_shadow=False, mode='cam'):
+	def render_image_core(self, idx, rays_o, rays_d, proj_params, illum_params, visualize_shadow=False):
 		H, W, _ = rays_o.shape
 		rays_o = rays_o.reshape(-1, 3).split(self.batch_size // 1)
 		rays_d = rays_d.reshape(-1, 3).split(self.batch_size // 1)
-		true_rgb = true_rgb.reshape(-1, 3).split(self.batch_size // 1)
 
 		out_rgb_fine = []
 		out_alpha_fine = []
@@ -1008,7 +878,7 @@ class Runner:
 		out_transmittance = []
 		out_coord = []
 
-		for i, (rays_o_batch, rays_d_batch, true_rgb_batch) in tqdm(enumerate(zip(rays_o, rays_d, true_rgb))):
+		for i, (rays_o_batch, rays_d_batch) in tqdm(enumerate(zip(rays_o, rays_d))):
 			near, far = self.dataset.near_far_from_sphere(rays_o_batch, rays_d_batch)
 			background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
 
@@ -1023,15 +893,14 @@ class Runner:
 											  illum_params=illum_params,
 											  shadow_field_ratio=self.shadow_field_ratio,
 											  visualize_shadow=visualize_shadow,
-											  disable_shadow=self.iter_step<self.shadow_field_begin and not visualize_shadow,
-											  mode=mode)
+											  disable_shadow=self.iter_step<self.shadow_field_begin and not visualize_shadow)
 
 			def feasible(key): return (key in render_out) and (render_out[key] is not None)
 
 			if feasible('color_fine'):
 				out_rgb_fine.append(render_out['color_fine'].cpu().detach())
-			if feasible('weight_sum'):
-				out_alpha_fine.append(render_out['weight_sum'].cpu().detach())
+			if feasible('weight_max'):
+				out_alpha_fine.append(render_out['weight_max'].cpu().detach())
 			if feasible('gradients') and feasible('weights'):
 				n_samples = self.renderer.n_samples + self.renderer.n_importance
 				normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
@@ -1057,7 +926,7 @@ class Runner:
 		normal_img = None
 		if len(out_normal_fine) > 0:
 			normal_img = torch.cat(out_normal_fine, dim=0)
-			rot = torch.linalg.inv(self.dataset.camera_params.get_pose(idx)[:3, :3])
+			rot = torch.linalg.inv(self.dataset.camera_params.get_cam_pose_inv(idx)[:3, :3])
 			normal_img = (torch.matmul(rot[None, :, :].cpu().detach(), normal_img[:, :, None]).view([H, W, 3]) * 0.5 + 0.5).clamp(0, 1)
 
 		opacity_tensor = None
@@ -1070,66 +939,11 @@ class Runner:
 		return img_fine, normal_img, alpha_fine, opacity_tensor
 
 
-	def render_image_impl(self, idx, resolution_level=-1, illum_params_override=None, visualize_shadow=False, mode='cam'):
+	def render_image_impl(self, idx, resolution_level=-1, illum_params_override=None, visualize_shadow=False):
 		if resolution_level < 0:
 			resolution_level = self.validate_resolution_level
 		
-		with torch.no_grad():
-			rays_o, rays_d, true_rgb = self.dataset.gen_rays_at(idx, resolution_level=resolution_level, mode=mode)
-
-		if self.dataset.with_projection:
-			proj_params = self.dataset.get_proj_params(torch.tensor(idx), mode)
-			if illum_params_override is None:
-				illum_params = self.dataset.illumination_params(idx)
-			else:
-				illum_params = illum_params_override
-		else:
-			proj_params = []
-			illum_params = None
-
-		img_fine, normal_img, alpha_fine, opacity_tensor = self.render_image_core(idx - self.image_ind_offset, 
-			rays_o, rays_d, true_rgb, proj_params, illum_params, visualize_shadow, mode)
-		return img_fine, normal_img, alpha_fine, opacity_tensor
-
-
-	def render_image(self, idx, resolution_level=-1, illum_params_override=None, visualize_shadow=False, mode='cam', return_gt=False):
-		if self.event_mode is not None:
-			idx_prev, idx_next = get_event_indices(idx, self.image_perm, self.event_mode)
-			img_fine_next, normal_img, alpha_fine, _ = self.render_image_impl(idx_next, resolution_level, illum_params_override, visualize_shadow, mode)
-			img_fine_prev, _, _, _                   = self.render_image_impl(idx_prev, resolution_level, illum_params_override, visualize_shadow, mode)
-			img_fine = self.event_camera_model(img_fine_prev, img_fine_next)
-
-			if return_gt:
-				if self.event_mode != "sequential":
-					img_prev_gt = self.dataset.image_at(idx_prev, resolution_level=resolution_level) / 255
-					img_next_gt = self.dataset.image_at(idx_next, resolution_level=resolution_level) / 255
-					img_gt = self.event_camera_model(img_prev_gt, img_next_gt) * 255
-				else:
-					img_gt = self.dataset.image_at(idx, resolution_level=resolution_level)
-
-		else:
-			img_fine, normal_img, alpha_fine, _ = self.render_image_impl(idx, resolution_level, illum_params_override, visualize_shadow, mode)
-			img_fine_prev = None
-
-			if return_gt:
-				img_gt = self.dataset.image_at(idx, resolution_level=resolution_level)
-
-		img_fine = img_fine.cpu().detach().numpy() * 255
-		if normal_img is not None:
-			normal_img = normal_img.cpu().detach().numpy() * 255
-		if alpha_fine is not None:
-			alpha_fine = alpha_fine.cpu().detach().numpy() * 255
-		if img_fine_prev is not None:
-			img_fine_prev = img_fine_prev.cpu().detach().numpy() * 255
-
-		if return_gt:
-			return img_fine, normal_img, alpha_fine, img_fine_prev, img_gt
-		else:
-			return img_fine, normal_img, alpha_fine, img_fine_prev
-
-
-	def render_image_satellite(self, rot, resolution_level=-1, illum_params_override=None, visualize_shadow=False):
-		rays_o, rays_d, true_rgb = self.dataset.gen_rays_satellite(rot, resolution_level=resolution_level)
+		rays_o, rays_d = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
 
 		if self.dataset.with_projection:
 			proj_params = self.dataset.get_proj_params(torch.from_numpy(np.int32([idx])))
@@ -1141,7 +955,45 @@ class Runner:
 			proj_params = []
 			illum_params = None
 
-		img_fine, _, _, _, _ = self.render_image_core(0, rays_o, rays_d, true_rgb, proj_params, illum_params, visualize_shadow)
+		img_fine, normal_img, alpha_fine, opacity_tensor = self.render_image_core(idx, rays_o, rays_d, proj_params, illum_params, visualize_shadow)
+		return img_fine, normal_img, alpha_fine, opacity_tensor
+
+
+	def render_image(self, idx, resolution_level=-1, illum_params_override=None, visualize_shadow=False):
+		if args.event_mode is not None:
+			idx_ref = get_event_ref_indices(idx, self.dataset.n_images, args.event_mode)
+			img_fine_prev, normal_img, alpha_fine, _ = self.render_image_impl(idx, resolution_level, illum_params_override, visualize_shadow)
+			img_fine_next, _, _, _, _ = self.render_image_impl(idx_ref, resolution_level, illum_params_override, visualize_shadow)
+			img_fine = self.event_camera_model(img_fine_next, img_fine_prev)
+
+		else:
+			img_fine, normal_img, alpha_fine, _ = self.render_image_impl(idx, resolution_level, illum_params_override, visualize_shadow)
+			img_fine_prev = None
+
+		img_fine = img_fine.cpu().detach().numpy() * 255
+		if normal_img is not None:
+			normal_img = normal_img.cpu().detach().numpy() * 255
+		if alpha_fine is not None:
+			alpha_fine = alpha_fine.cpu().detach().numpy() * 255
+		if img_fine_prev is not None:
+			img_fine_prev = img_fine_prev.cpu().detach().numpy() * 255
+		return img_fine, normal_img, alpha_fine, img_fine_prev
+
+
+	def render_image_satellite(self, rot, resolution_level=-1, illum_params_override=None, visualize_shadow=False):
+		rays_o, rays_d = self.dataset.gen_rays_satellite(rot, resolution_level=resolution_level)
+
+		if self.dataset.with_projection:
+			proj_params = self.dataset.get_proj_params(torch.from_numpy(np.int32([idx])))
+			if illum_params_override is None:
+				illum_params = self.dataset.illumination_params()
+			else:
+				illum_params = illum_params_override
+		else:
+			proj_params = []
+			illum_params = None
+
+		img_fine, _, _, _, _ = self.render_image_core(0, rays_o, rays_d, proj_params, illum_params, visualize_shadow)
 		img_fine = img_fine.cpu().detach().numpy() * 255
 		return img_fine
 
@@ -1150,7 +1002,7 @@ class Runner:
 		"""
 		Interpolate view between two cameras.
 		"""
-		rays_o, rays_d, true_rgb = self.dataset.gen_rays_between(idx_0, idx_1, ratio, resolution_level=resolution_level)
+		rays_o, rays_d = self.dataset.gen_rays_between(idx_0, idx_1, ratio, resolution_level=resolution_level)
 
 		if self.dataset.with_projection:
 			proj_params_0 = self.dataset.get_proj_params(torch.from_numpy(np.int32([idx_0])))
@@ -1170,17 +1022,17 @@ class Runner:
 			proj_params = []
 			illum_params = None
 
-		img_fine, normal_img, alpha_fine, _, _ = self.render_image_core(idx_0, rays_o, true_rgb, rays_d, proj_params, illum_params)
+		img_fine, normal_img, alpha_fine, _, _ = self.render_image_core(idx_0, rays_o, rays_d, proj_params, illum_params)
 		return img_fine, alpha_fine
 
 
 	def render_novel_image(self, idx_0, idx_1, ratio, resolution_level, illum_params_override=None):
 		if args.event_mode is not None:
-			idx_0_prev, idx_0_next = get_event_indices(idx_0, self.image_perm, args.event_mode)
-			idx_1_prev, idx_1_next = get_event_indices(idx_1, self.image_perm, args.event_mode)
-			img_fine_prev, alpha_fine = self.render_novel_image_impl(idx_0_prev, idx_1_prev, ratio, resolution_level, illum_params_override)
-			img_fine_next, _          = self.render_novel_image_impl(idx_0_next, idx_1_next, ratio, resolution_level, illum_params_override)
-			img_fine = self.event_camera_model(img_fine_prev, img_fine_next)
+			idx_0_ref = get_event_ref_indices(idx_0, self.dataset.n_images, args.event_mode)
+			idx_1_ref = get_event_ref_indices(idx_1, self.dataset.n_images, args.event_mode)
+			img_fine, alpha_fine = self.render_novel_image_impl(idx_0, idx_1, ratio, resolution_level, illum_params_override)
+			img_fine_next, _ = self.render_novel_image_impl(idx_0_ref, idx_1_ref, ratio, resolution_level, illum_params_override)
+			img_fine = self.event_camera_model(img_fine_next, img_fine)
 
 		else:
 			img_fine, alpha_fine = self.render_novel_image_impl(idx_0, idx_1, ratio, resolution_level, illum_params_override)
@@ -1198,35 +1050,25 @@ class Runner:
 		print('Validate: iter: {}, camera: {}'.format(self.iter_step, idx))
 		if resolution_level < 0:
 			resolution_level = self.validate_resolution_level
-		img_fine, normal_img, img_fine_orig, _, img_gt = self.render_image(idx, resolution_level, illum_params_override, return_gt=True)
+		img_fine, normal_img, img_fine_orig, _ = self.render_image(idx, resolution_level, illum_params_override)
 #		img_fine_albedo, _, _, _ = self.render_image(idx, resolution_level, {"ambient": 1.0, "diffuse": 0.0, "emissive": 0.0})
 
 		os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
 		os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
 
+		img_gt = self.dataset.image_at(idx, resolution_level=resolution_level)
 		mask_gt = self.dataset.mask_at(idx, resolution_level=resolution_level)
-
 		if img_fine.shape[-1] == 1:
 			img_gt = img_gt.mean(axis=-1, keepdims=True)
 			mask_gt = mask_gt.mean(axis=-1, keepdims=True)
-		cv2.imwrite(os.path.join(self.base_exp_dir, 'validations_fine', '{:0>8d}_{}.png'.format(self.iter_step, idx)),
-					np.vstack([np.hstack([img_fine, img_gt]), np.hstack([np.abs(img_fine - img_gt), mask_gt])]))
+		cv2.imwrite(os.path.join(self.base_exp_dir, 'validations_fine', '{:0>8d}_{}.png'.format(self.iter_step, 0)),
+				   np.vstack([np.hstack([img_fine, img_gt]), np.hstack([np.abs(img_fine - img_gt), mask_gt])]))
 		if normal_img is not None:
-			cv2.imwrite(os.path.join(self.base_exp_dir, 'normals', '{:0>8d}_{}.png'.format(self.iter_step, idx)), normal_img)
+			cv2.imwrite(os.path.join(self.base_exp_dir, 'normals', '{:0>8d}_{}.png'.format(self.iter_step, 0)), normal_img)
 
 		if img_fine_orig is not None:
 			os.makedirs(os.path.join(self.base_exp_dir, 'validations_orig'), exist_ok=True)
-			cv2.imwrite(os.path.join(self.base_exp_dir, 'validations_orig', '{:0>8d}_{}.png'.format(self.iter_step, idx)), img_fine_orig)
-
-		patterns_gt = self.dataset.patterns_at(idx, resolution_level=resolution_level)
-
-		if len(patterns_gt) > 0 and (self.reverse_rendering_weight_begin > 0 or self.reverse_rendering_weight_end > 0):
-			os.makedirs(os.path.join(self.base_exp_dir, 'validations_proj'), exist_ok=True)
-			img_fine_proj, _, proj_mask, _ = self.render_image(idx, resolution_level, illum_params_override, mode='proj')
-			pattern_diff = np.abs(patterns_gt[0] - img_fine_proj) * proj_mask / 255
-			cv2.imwrite(os.path.join(self.base_exp_dir, 'validations_proj', '{:0>8d}_{}.png'.format(self.iter_step, idx)),
-						np.vstack([np.hstack([img_fine_proj, patterns_gt[0]]), np.hstack([pattern_diff, np.repeat(proj_mask, 3, axis=2)])]))
-
+			cv2.imwrite(os.path.join(self.base_exp_dir, 'validations_orig', '{:0>8d}_{}.png'.format(self.iter_step, 0)), img_fine_orig)
 
 
 	def validate_shadow(self, idx=-1, resolution_level=-1):
@@ -1236,7 +1078,7 @@ class Runner:
 		print('Validate: iter: {}, camera: {}'.format(self.iter_step, idx))
 		if resolution_level < 0:
 			resolution_level = self.validate_resolution_level
-		shadow_img, _, _, _ = self.render_image(idx, resolution_level, None, visualize_shadow=True)
+		shadow_img, _, _, _, _ = self.render_image(idx, resolution_level, None, visualize_shadow=True)
 
 		img_gt = self.dataset.image_at(idx, resolution_level=resolution_level)
 		if shadow_img.shape[-1] == 1:
@@ -1252,21 +1094,18 @@ class Runner:
 		os.makedirs(os.path.join(self.base_exp_dir, 'cam_poses'), exist_ok=True)
 		step = max(self.dataset.n_images // num_cameras, 1) if num_cameras is not None else 1
 		with torch.no_grad():
-			cam_poses = torch.stack([self.dataset.camera_params.get_pose(i) for i in range(0,self.dataset.n_images,step)])
-			cam_poses_gt = torch.stack([self.dataset.camera_params.get_pose_gt(i) for i in range(0,self.dataset.n_images,step)])
+			cam_poses = torch.stack([self.dataset.camera_params.get_cam_pose_inv(i) for i in range(0,self.dataset.n_images,step)])
+			cam_poses_gt = torch.stack([self.dataset.camera_params.get_cam_pose_inv_gt(i) for i in range(0,self.dataset.n_images,step)])
 			fig = plot_camera_scene(cam_poses, cam_poses_gt, "Estimated camera poses")
 		fig.savefig(os.path.join(self.base_exp_dir, 'cam_poses', '{:0>8d}.png'.format(self.iter_step)))
 
 
-	def validate_proj_pose(self, index=None):
-		if index is None:
-			index = self.image_ind_offset
+	def validate_proj_pose(self):
 		os.makedirs(os.path.join(self.base_exp_dir, 'proj_poses'), exist_ok=True)
 		with torch.no_grad():
-			cam_pose = self.dataset.camera_params.get_pose(index).unsqueeze(0)
-			proj_poses = torch.cat([cam_pose, cam_pose @ self.dataset.projector_params.get_pose(index)], dim=0)
-			proj_poses_gt = torch.cat([cam_pose, cam_pose @ self.dataset.projector_params.get_pose_gt(index)], dim=0)
-			fig = plot_camera_scene(proj_poses, proj_poses_gt, "Estimated projector poses", with_icp=False)
+			proj_poses = torch.linalg.inv(self.dataset.projector_params.get_proj_pose(0)[0])
+			proj_poses_gt = torch.linalg.inv(self.dataset.projector_params.get_proj_pose_gt(0)[0])
+			fig = plot_camera_scene(proj_poses, proj_poses_gt, "Estimated projector poses")
 		fig.savefig(os.path.join(self.base_exp_dir, 'proj_poses', '{:0>8d}.png'.format(self.iter_step)))
 
 
@@ -1280,20 +1119,15 @@ class Runner:
 				cv2.imwrite(os.path.join(self.base_exp_dir, 'patterns', '{:0>8d}_{:0>3d}.png'.format(self.iter_step, i)), (patterns * 255).astype(np.uint8))
 
 
-	def validate_mesh(self, world_space=True, time=0, suffix="", swap_time_axis=None, mass_center=None):
+	def validate_mesh(self, world_space=True, threshold=0.0, time=0, suffix="", swap_time_axis=None):
 		bound_min = torch.tensor(self.dataset.object_bbox_min * self.mesh_extract_scale, dtype=torch.float32)
 		bound_max = torch.tensor(self.dataset.object_bbox_max * self.mesh_extract_scale, dtype=torch.float32)
 
-		if mass_center is not None:
-			mass_center = self.dataset.scale_mat_inv[:3,:3] @ torch.from_numpy(np.float32(mass_center)).to(self.device) + self.dataset.scale_mat_inv[:3,3][None]
-
 		vertices, triangles =\
-			self.renderer.extract_geometry(bound_min, bound_max, resolution=self.val_mesh_resolution, 
-				time=time - self.image_ind_offset, swap_time_axis=swap_time_axis, mass_center=mass_center)
+			self.renderer.extract_geometry(bound_min, bound_max, resolution=self.val_mesh_resolution, threshold=threshold, time=time, swap_time_axis=swap_time_axis)
 		os.makedirs(os.path.join(self.base_exp_dir, 'meshes'), exist_ok=True)
 		if world_space:
-			scale_mat = self.dataset.scale_mat.cpu().detach().numpy()
-			vertices = vertices * scale_mat[0, 0] + scale_mat[:3, 3][None]
+			vertices = vertices * self.dataset.camera_params.scale_mats_np[0][0, 0] + self.dataset.camera_params.scale_mats_np[0][:3, 3][None]
 
 		mesh = trimesh.Trimesh(vertices, triangles)
 #		mesh = remove_floaters(mesh)
@@ -1378,27 +1212,22 @@ if __name__ == '__main__':
 	parser.add_argument('--mask_ratio', type=float, default=1)
 	parser.add_argument('--illum_params', type=float, nargs="+")
 	parser.add_argument('--estimate_illumination', action='store_true')
-	parser.add_argument('--cam_noise', type=json.loads)
-	parser.add_argument('--estimate_cam_intrinsic', action='store_true')
-	parser.add_argument('--estimate_cam_pose', action='store_true')
-	parser.add_argument('--estimate_last_cam_pose', action='store_true')
-	parser.add_argument('--use_mlp_for_pose', action='store_true')
-	parser.add_argument('--proj_noise', type=json.loads)
-	parser.add_argument('--estimate_proj_intrinsic', action='store_true')
+	parser.add_argument('--pose_noise', type=json.loads)
+	parser.add_argument('--estimate_pose', action='store_true')
+	parser.add_argument('--estimate_last_pose', action='store_true')
+	parser.add_argument('--proj_pose_noise', type=json.loads)
 	parser.add_argument('--estimate_proj_pose', action='store_true')
 	parser.add_argument('--pattern_noise', type=json.loads)
+	parser.add_argument('--estimate_pattern', action='store_true')
 
 	parser.add_argument('--estimate_cam_refraction', action='store_true')
 	parser.add_argument('--cam_refractive_interface_params', type=json.loads)
 	parser.add_argument('--estimate_proj_refraction', action='store_true')
 	parser.add_argument('--proj_refractive_interface_params', type=json.loads)
-	parser.add_argument('--frame_weights', action='store_true')
 
 	parser.add_argument('--num_images', type=int)
-	parser.add_argument('--num_images_policy', type=str, choices=['interval', 'first'], default='interval')
 	parser.add_argument('--num_images_incremental', type=int, default=0)
 	parser.add_argument('--num_images_incremental_start', type=int, default=0)
-	parser.add_argument('--min_num_images', type=int, default=1)
 	parser.add_argument('--image_ind_offset', type=int, default=0)
 	parser.add_argument('--dynamic', action='store_true')
 	parser.add_argument('--freeze', type=str, nargs="*", default=[])
@@ -1407,18 +1236,11 @@ if __name__ == '__main__':
 	parser.add_argument('--pretrain_sdf_network', action="store_true")
 	parser.add_argument('--initial_shape_type', type=str, default="sphere")
 	parser.add_argument('--initial_shape_mesh', type=str)
-	parser.add_argument('--event_mode', type=str, choices=["sequential", "accumulated", "random"])
-	parser.add_argument('--simulate_event', action="store_true")
+	parser.add_argument('--event_mode', type=str, choices=["sequential", "accumulated", "interval", "mixed"])
 	parser.add_argument('--scene_scale', type=float, default=1.0)
-	parser.add_argument('--baseline_scale', type=float, default=1.0)
-
-	parser.add_argument('--mass_center', type=float, nargs="+")
 
 	parser.add_argument('--profiling', type=int)
-	parser.add_argument('--seed', type=int, default=42)
 	args = parser.parse_args()
-
-	torch_fix_seed(args.seed)
 
 	if args.illum_params is not None:
 		illum_params = {
@@ -1429,21 +1251,19 @@ if __name__ == '__main__':
 	else:
 		illum_params = None
 
-#	torch.cuda.set_device(args.gpu)
+	torch.cuda.set_device(args.gpu)
 	runner = Runner(args.conf, args.mode, args.exp_name, args.case, args.load, args.load_metadata, args.load_params, args.resume,
-		num_images=args.num_images, num_images_policy=args.num_images_policy, num_images_incremental=args.num_images_incremental, 
-		num_images_incremental_start=args.num_images_incremental_start, min_num_images=args.min_num_images,
+		num_images=args.num_images, num_images_incremental=args.num_images_incremental, num_images_incremental_start=args.num_images_incremental_start,
 		image_ind_offset=args.image_ind_offset, dynamic=args.dynamic,
 		mask_ratio=args.mask_ratio, initial_illum_params=illum_params, estimate_illumination=args.estimate_illumination, 
-		estimate_cam_intrinsic=args.estimate_cam_intrinsic, estimate_cam_pose=args.estimate_cam_pose, use_mlp_for_pose=args.use_mlp_for_pose,
-		estimate_last_cam_pose=args.estimate_last_cam_pose, cam_noise=args.cam_noise, 
-		estimate_proj_intrinsic=args.estimate_proj_intrinsic, estimate_proj_pose=args.estimate_proj_pose, 
-		proj_noise=args.proj_noise, pattern_noise=args.pattern_noise, 
+		estimate_pose=args.estimate_pose, estimate_last_pose=args.estimate_last_pose, pose_noise=args.pose_noise, 
+		estimate_proj_pose=args.estimate_proj_pose, proj_pose_noise=args.proj_pose_noise,
+		estimate_pattern=args.estimate_pattern, pattern_noise=args.pattern_noise, 
 		estimate_cam_refraction=args.estimate_cam_refraction, cam_refractive_interface_params=args.cam_refractive_interface_params,
 		estimate_proj_refraction=args.estimate_proj_refraction, proj_refractive_interface_params=args.proj_refractive_interface_params,
-		frame_weights=args.frame_weights,	end_iter=args.end_iter,	overwrite_params=args.overwrite_params, freeze=args.freeze,
+		end_iter=args.end_iter,	overwrite_params=args.overwrite_params, freeze=args.freeze,
 		pretrain_sdf_network=args.pretrain_sdf_network, initial_shape_type=args.initial_shape_type, initial_shape_mesh=args.initial_shape_mesh,
-		event_mode=args.event_mode, simulate_event=args.simulate_event, scene_scale=args.scene_scale, baseline_scale=args.baseline_scale, profiling=args.profiling)
+		event_mode=args.event_mode, scene_scale=args.scene_scale, profiling=args.profiling)
 
 	runner.renderer.eval()
 
@@ -1467,7 +1287,7 @@ if __name__ == '__main__':
 	elif args.mode.startswith('validate_mesh_interp'):
 		_, _, _, axis = args.mode.split('_')
 		axis = int(axis)
-		runner.validate_mesh(time=args.image_ind_offset, suffix="_interp_%d" % axis, swap_time_axis=axis, mass_center=args.mass_center)
+		runner.validate_mesh(time=args.image_ind_offset, suffix="_interp_%d" % axis, swap_time_axis=axis)
 
 	elif args.mode.startswith('validate_mesh_multi'):
 		_, _, _, begin, end, stride = args.mode.split('_')
@@ -1489,13 +1309,15 @@ if __name__ == '__main__':
 		render_name = args.render_name if args.render_name is not None else "render"
 		os.makedirs(os.path.join(runner.base_exp_dir, render_name), exist_ok=True)
 
-		for idx in range(runner.num_images):
+		for idx in range(runner.dataset.n_images):
 			print("Rendering", idx)
-			img, normal, alpha, img_orig, img_gt = runner.render_image(idx, 1, illum_params, return_gt=True)
+			img, normal, alpha, img_orig, _ = runner.render_image(idx, 1, illum_params)
 #			if img.shape[-1] == 1:
 #				img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
 #			img = np.dstack([img, alpha])
 			cv2.imwrite(os.path.join(runner.base_exp_dir, render_name, '%03d.png' % idx), img)
+
+			img_gt = runner.dataset.image_at(idx, resolution_level=1)
 			cv2.imwrite(os.path.join(runner.base_exp_dir, render_name, '%03d_gt.png' % idx), img_gt)
 
 			if img_orig is not None:

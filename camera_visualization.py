@@ -44,14 +44,13 @@ def get_camera_wireframe(scale: float = 0.3):
 	return lines
 
 
-def plot_cameras(ax, cam_poses, max_trans = None, color: str = "blue", scale=0.05):
+def plot_cameras(ax, cam_poses, color: str = "blue", scale=0.05):
 	"""
 	Plots a set of `cameras` objects into the maplotlib axis `ax` with
 	color `color`.
 	"""
-	if max_trans is None:
-		cam_tvecs = cam_poses[:,:3,3].cpu().numpy()
-		max_trans = np.max(np.linalg.norm(cam_tvecs[np.newaxis,:,:] - cam_tvecs[:,np.newaxis,:], axis=-1))
+	cam_tvecs = cam_poses[:,:3,3].cpu().numpy()
+	max_trans = np.max(np.linalg.norm(cam_tvecs[np.newaxis,:,:] - cam_tvecs[:,np.newaxis,:], axis=-1))
 
 	cam_wires_canonical = get_camera_wireframe(max_trans * scale).cuda()[None]
 #    cam_trans = cameras.get_world_to_view_transform().inverse()
@@ -61,7 +60,8 @@ def plot_cameras(ax, cam_poses, max_trans = None, color: str = "blue", scale=0.0
 	cam_wires_trans = torch.matmul(cam_poses.cuda(), cam_wires_canonical.permute(0,2,1)).permute(0,2,1)[...,:3]
 	plot_handles = []
 	for wire in cam_wires_trans:
-		x_, y_, z_ = wire.detach().cpu().numpy().T.astype(float)
+		# the Z and Y axes are flipped intentionally here!
+		x_, z_, y_ = wire.detach().cpu().numpy().T.astype(float)
 		(h,) = ax.plot(x_, y_, z_, color=color, linewidth=0.3)
 		plot_handles.append(h)
 
@@ -112,34 +112,22 @@ def plot_camera_scene(cameras, cameras_gt, status: str, scale=0.05, with_icp=Tru
 	cameras[:,:3,3] -= mean_tvec
 	cameras_gt[:,:3,3] -= mean_tvec
 
-	cam_tvecs = cameras[:,:3,3].cpu().numpy()
-	cam_tvecs_gt = cameras_gt[:,:3,3].cpu().numpy()
-	max_trans = max(
-		np.max(np.linalg.norm(cam_tvecs[np.newaxis,:,:] - cam_tvecs[:,np.newaxis,:], axis=-1)),
-		np.max(np.linalg.norm(cam_tvecs_gt[np.newaxis,:,:] - cam_tvecs_gt[:,np.newaxis,:], axis=-1))
-	)
-	if max_trans == 0:
-		max_trans = 1
-
-	handle_cam = plot_cameras(ax, cameras, max_trans=max_trans, color="#FF7D1E", scale=scale)
-	handle_cam_gt = plot_cameras(ax, cameras_gt, max_trans=max_trans, color="#812CE5", scale=scale)
+	handle_cam = plot_cameras(ax, cameras, color="#FF7D1E", scale=scale)
+	handle_cam_gt = plot_cameras(ax, cameras_gt, color="#812CE5", scale=scale)
 #	handle_cam = plot_cameras(ax, cameras, color="red", scale=scale)
 #	handle_cam_gt = plot_cameras(ax, cameras_gt, color="green", scale=scale)
 
 	tvec = cameras[:,:3,3].cpu().numpy()
 	tvec_gt = cameras_gt[:,:3,3].cpu().numpy()
 	for i in range(len(tvec)):
-		x1, y1, z1 = tvec[i]
-		x2, y2, z2 = tvec_gt[i]
+		x1, z1, y1 = tvec[i]
+		x2, z2, y2 = tvec_gt[i]
 		ax.plot([x1, x2], [y1, y2], [z1, z2], color="red", linewidth=0.5)
 
 	plot_radius = max(
 		np.max(np.linalg.norm(tvec[np.newaxis,:] - tvec[:,np.newaxis], axis=-1)),
 		np.max(np.linalg.norm(tvec_gt[np.newaxis,:] - tvec_gt[:,np.newaxis], axis=-1)),
 	) / 2 * 0.8
-	if plot_radius == 0:
-		plot_radius = 0.1
-
 	ax.set_xlim3d([-plot_radius, plot_radius])
 	ax.set_ylim3d([-plot_radius, plot_radius])
 	ax.set_zlim3d([-plot_radius, plot_radius])

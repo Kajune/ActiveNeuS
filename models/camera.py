@@ -186,7 +186,6 @@ class Lie():
 class Quaternion():
 
     def q_to_R(self, q):  # [...,4]
-        q = q / q.norm(dim=-1, keepdim=True)
         # https://en.wikipedia.org/wiki/Rotation_matrix#Quaternion
         qa, qb, qc, qd = q.unbind(dim=-1)
         R = torch.stack(
@@ -196,7 +195,7 @@ class Quaternion():
             dim=-2)
         return R
 
-    def R_to_q(self, R, eps=1e-5):  # [...,3,3]
+    def R_to_q(self, R, eps=1e-6):  # [...,3,3]
         # https://en.wikipedia.org/wiki/Rotation_matrix#Quaternion
         row0, row1, row2 = R.unbind(dim=-2)
         R00, R01, R02 = row0.unbind(dim=-1)
@@ -218,8 +217,6 @@ class Quaternion():
         return q_inv
 
     def product(self, q1, q2):  # [...,4]
-        q1 = q1 / q1.norm(dim=-1, keepdim=True)
-        q2 = q2 / q2.norm(dim=-1, keepdim=True)
         q1a, q1b, q1c, q1d = q1.unbind(dim=-1)
         q2a, q2b, q2c, q2d = q2.unbind(dim=-1)
         hamil_prod = torch.stack([q1a * q2a - q1b * q2b - q1c * q2c - q1d * q2d,

@@ -62,31 +62,6 @@ def create_positional_encoding(W, H):
 	return pos_encoding
 
 
-def create_gaussian_kernel(kernel_size, sigma):
-	ax = torch.arange(kernel_size) - kernel_size // 2
-	xx, yy = torch.meshgrid(ax, ax, indexing='ij')
-	kernel = torch.exp(-(xx**2 + yy**2) / (2.0 * sigma**2))
-	kernel = kernel / kernel.sum()
-	return kernel
-
-
-def find_peak_interval(img):
-	unique_intensities = np.unique(img)
-
-	min_cost = np.inf
-	best_interval = 255
-
-	for i in range(len(unique_intensities),255):
-		intervals = np.linspace(0, 255, i)
-		cost = np.sum(np.min(np.abs(intervals[:,None] - unique_intensities[None,:]), axis=0)) + len(intervals) - len(unique_intensities)
-
-		if cost < min_cost:
-			min_cost = cost
-			best_interval = i
-
-	return best_interval
-
-
 class SingleConv(nn.Module):
 	def __init__(
 		self,

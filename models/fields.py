@@ -8,33 +8,14 @@ from models.embedder import get_embedder
 #from models.embedder_hash import get_embedder
 from .utils import *
 from . import camera
-from pytorch3d.transforms import euler_angles_to_matrix
-
-
-def analytic_sdf(x, kind):
-	if kind == "plane":
-		return x[...,2]
-	elif kind == "periodic":
-		r = torch.norm(x, dim=-1)
-		return torch.sin(5.0 * r * np.pi)
-	elif kind == "gyroid":
-		k = 2 * np.pi
-		return (
-			torch.sin(x[...,0] * k) * torch.cos(x[...,1] * k) +
-			torch.sin(x[...,1] * k) * torch.cos(x[...,2] * k) +
-			torch.sin(x[...,2] * k) * torch.cos(x[...,0] * k)
-		)
-	elif kind == "bumpy":
-		r = torch.norm(x, dim=-1)
-		return r - 0.5 + 0.05 * torch.sin(10*x[...,0]) * torch.sin(10*x[...,1]) * torch.sin(10*x[...,2])
-	else:
-		raise NotImplementedError
 
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class SDFNetwork(nn.Module):
 	def __init__(self,
 				 max_time,
+				 d_in,
+				 d_out,
 				 d_hidden,
 				 n_layers,
 				 skip_in=(4,),
@@ -42,61 +23,39 @@ class SDFNetwork(nn.Module):
 				 encoding="default",
 				 encoding_dropout=0.0,
 				 bias=0.5,
-				 std=1e-4,
 				 scale=1,
 				 geometric_init=True,
 				 weight_norm=True,
 				 inside_outside=False,
 				 time_dim=0,
 				 time_embedding_type=None,
-				 encoding_time="default",
-				 multires_time=None,
+				 time_encoding="default",
 				 n_time_emb_mlps=[5,20],
 				 concat_input_to_feature=False,
 				 grad_mode="analytical",
-				 init_normal_eps=2 / (2 ** 5),
-				 final_normal_eps=2 / (2 ** 11),
-				 deform_sdf=False,
-				 sdf_flow=False,
-				 progressive_until=0.0,
-				 initialization_strategy="sphere",
-				 final_activation=None,
+				 normal_eps=1e-3,
 		):
 		super(SDFNetwork, self).__init__()
 
-		d_in = 3
-		d_out = d_hidden + 1
-		dims = [d_in + time_dim] + [d_hidden for _ in range(n_layers)] + [d_out]
+		d_in += time_dim
+
+		dims = [d_in] + [d_hidden for _ in range(n_layers)] + [d_out]
 
 		self.embed_fn_fine = None
-		self.embed_fn_time = None
 		self.time_embedding_type = time_embedding_type
-		self.time_dim = time_dim
 		self.concat_input_to_feature = concat_input_to_feature
 		self.grad_mode = grad_mode
-		self.init_normal_eps = init_normal_eps
-		self.final_normal_eps = final_normal_eps
-		self.normal_eps = init_normal_eps
-		self.progressive_until = progressive_until
-		self.deform_sdf = deform_sdf
-		self.sdf_flow = sdf_flow
-		self.initialization_strategy = initialization_strategy
+		self.normal_eps = normal_eps
 
 		if multires > 0:
-			embed_fn, input_ch = get_embedder(encoding, multires, input_dims=d_in, dropout_ratio=encoding_dropout, progressive_until=progressive_until)
+			embed_fn, input_ch = get_embedder(encoding, multires, input_dims=d_in, dropout_ratio=encoding_dropout)
 			self.embed_fn_fine = embed_fn
-			dims[0] += input_ch - d_in
-
-		if time_dim > 0 and encoding_time is not None:
-			if multires_time is None:
-				multires_time = multires
-			self.embed_fn_time, input_ch = get_embedder(encoding_time, multires_time, input_dims=time_dim, dropout_ratio=encoding_dropout, progressive_until=progressive_until)
-			dims[0] += input_ch - time_dim
+			dims[0] = input_ch
 
 		if self.time_embedding_type is not None:
 			assert time_dim > 0
 
-			embed_fn_static, static_ch = get_embedder(encoding_time, multires, input_dims=d_in - time_dim, dropout_ratio=encoding_dropout, progressive_until=progressive_until)
+			embed_fn_static, static_ch = get_embedder(time_encoding, multires, input_dims=d_in - time_dim, dropout_ratio=encoding_dropout)
 			self.embed_fn_static = embed_fn_static
 
 			if self.time_embedding_type == "interp":
@@ -113,7 +72,7 @@ class SDFNetwork(nn.Module):
 		self.num_layers = len(dims)
 		self.skip_in = skip_in
 		self.scale = scale
-#		self.delta_size = 1e-3
+		self.delta_size = 1e-3
 #		self.register_buffer("numerical_delta", torch.from_numpy(np.float32([[-1,0,0],[0,-1,0],[0,0,-1],[1,0,0],[0,1,0],[0,0,1]]) * self.delta_size))
 
 		for l in range(0, self.num_layers - 1):
@@ -133,18 +92,12 @@ class SDFNetwork(nn.Module):
 
 			if geometric_init:
 				if l == self.num_layers - 2:
-					if self.initialization_strategy == "sphere":
-						if not inside_outside:
-							torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(in_dim), std=std)
-							torch.nn.init.constant_(lin.bias, -bias)
-						else:
-							torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(in_dim), std=std)
-							torch.nn.init.constant_(lin.bias, bias)
-
-					elif self.initialization_strategy == "constant":
-						torch.nn.init.normal_(lin.weight, mean=0.0, std=std)
+					if not inside_outside:
+						torch.nn.init.normal_(lin.weight, mean=np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
 						torch.nn.init.constant_(lin.bias, -bias)
-
+					else:
+						torch.nn.init.normal_(lin.weight, mean=-np.sqrt(np.pi) / np.sqrt(in_dim), std=0.0001)
+						torch.nn.init.constant_(lin.bias, bias)
 				elif multires > 0 and l == 0:
 					torch.nn.init.constant_(lin.bias, 0.0)
 					torch.nn.init.constant_(lin.weight[:, d_in:], 0.0)
@@ -163,55 +116,24 @@ class SDFNetwork(nn.Module):
 			setattr(self, "lin" + str(l), lin)
 
 		self.activation = nn.Softplus(beta=100)
-		self.final_activation = None
-		if final_activation == "sigmoid":
-			self.final_activation = nn.Sigmoid()
-
-		if self.initialization_strategy in ["periodic", "gyroid", "bumpy", "plane"]:
-			self._pretrain_analytic_sdf(self.initialization_strategy)
-
-		if self.deform_sdf:
-			self.embed_fn_deform, dim = get_embedder(encoding_time, multires, input_dims=d_in + time_dim, dropout_ratio=encoding_dropout)
-
-#			dims = [dim, d_hidden, d_hidden, 1]
-			dims = [dim, 1]
-
-			layers = []
-			for i in range(len(dims) - 1):
-				in_dim = dims[i]
-				out_dim = dims[i + 1]
-				lin = nn.Linear(in_dim, out_dim)
-				torch.nn.init.normal_(lin.weight, mean=0.0, std=0.0001)
-				torch.nn.init.constant_(lin.bias, 0.0)
-				layers.append(lin)
-
-				if i < len(dims) - 2:
-					layers.append(nn.Softplus(beta=100))
-
-			self.deform_net = nn.Sequential(*layers)
 
 
-	def _pretrain_analytic_sdf(self, kind, steps=2000, lr=1e-3, n=100000):
-		device = next(self.parameters()).device
-		optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+	def forward(self, inputs, time, is_reference_frame=False):
+		inputs = inputs * self.scale
 
-		self.train()
-		for i in range(steps):
-			x = (torch.rand(n,3, device=device) * 2 - 1)
-			gt = analytic_sdf(x, kind).detach()
+		if self.time_embedding_type is not None:
+			if self.embed_fn_fine is not None:
+				inputs_static = self.embed_fn_static(inputs[...,:3]).float()
+				inputs_dynamic = self.embed_fn_fine(inputs).float()
+			else:
+				inputs_static = inputs[...,:3]
+				inputs_dynamic = inputs
 
-			pred = self.sdf(x, 0)
-			loss = F.l1_loss(pred.squeeze(-1), gt)
+			inputs = self.time_embedding(inputs_static, inputs_dynamic, time, is_reference_frame)
+		else:
+			if self.embed_fn_fine is not None:
+				inputs = self.embed_fn_fine(inputs).float()
 
-			optimizer.zero_grad()
-			loss.backward()
-			optimizer.step()
-
-			if i % 500 == 0:
-				print(f"[{kind} pretrain] step {i}, loss {loss.item():.6f}")
-
-
-	def forward_core(self, inputs):
 		x = inputs
 		for l in range(0, self.num_layers - 1):
 			lin = getattr(self, "lin" + str(l))
@@ -224,67 +146,6 @@ class SDFNetwork(nn.Module):
 			if l < self.num_layers - 2:
 				x = self.activation(x)
 
-		if self.final_activation is not None:
-			x = self.final_activation(x)
-
-		return x
-
-
-	def forward(self, inputs, time):
-		inputs = inputs * self.scale
-
-		if self.sdf_flow:
-			pos_ = inputs[...,:3]
-			if self.embed_fn_fine is not None:
-				pos_ = self.embed_fn_fine(pos_).float()
-
-			sdf = None
-			for t in range(time + 1):
-				time_ = torch.ones_like(inputs[...,3:]) * t
-				if self.embed_fn_time is not None:
-					time_ = self.embed_fn_time(time_).float()
-				inputs_ = torch.cat([pos_, time_], dim=-1)
-				x = self.forward_core(inputs_)
-				if sdf is None:
-					sdf = x[:,:1]
-				else:
-					sdf += x[:,:1]
-			feature = x[:,1:]
-			x = torch.cat([sdf, feature], dim=-1)
-
-		else:
-			if self.time_embedding_type is not None:
-				if self.embed_fn_fine is not None:
-					inputs_static = self.embed_fn_static(inputs[...,:3]).float()
-					inputs_dynamic = self.embed_fn_fine(inputs).float()
-				else:
-					inputs_static = inputs[...,:3]
-					inputs_dynamic = inputs
-
-				inputs_ = self.time_embedding(inputs_static, inputs_dynamic, time)
-
-			elif self.time_dim > 0:
-				pos_ = inputs[...,:3]
-				time_ = inputs[...,3:]
-
-				if self.embed_fn_fine is not None:
-					pos_ = self.embed_fn_fine(pos_).float()
-
-				if self.embed_fn_time is not None:
-					time_ = self.embed_fn_time(time_).float()
-
-				inputs_ = torch.cat([pos_, time_], dim=-1)
-			else:
-				inputs_ = inputs
-				if self.embed_fn_fine is not None:
-					inputs_ = self.embed_fn_fine(inputs_).float()
-
-			x = self.forward_core(inputs_)
-
-		if self.deform_sdf and time > 0:
-			inputs_ = self.embed_fn_deform(inputs)
-			x[:,:1] = x[:,:1] + self.deform_net(inputs_)
-
 		outputs = [x[:, :1] / self.scale, x[:, 1:]]
 		if self.concat_input_to_feature:
 			outputs.append(inputs)
@@ -296,34 +157,15 @@ class SDFNetwork(nn.Module):
 	def sdf_hidden_appearance(self, x, time):
 		return self.forward(x, time)
 
-	def gradient(self, x, time, compute_hessian=False, sdf=None):
-#		if sdf is None:
+	def gradient(self, x, time, compute_hessian=False):
 		x.requires_grad_(True)
 		sdf = self.sdf(x, time)
 
 		if self.grad_mode == "analytical":
-			gradients = torch.autograd.grad(sdf.sum(), x, create_graph=True, only_inputs=True)[0]
+			gradients = torch.autograd.grad(sdf.sum(), x, create_graph=True)[0]
 			if compute_hessian:
-				hessians = torch.autograd.grad(gradients.sum(), x, create_graph=True, only_inputs=True)[0]
+				hessians = torch.autograd.grad(gradients.sum(), x, create_graph=True)[0]
 				return gradients.unsqueeze(1), hessians.unsqueeze(1)
-
-			return gradients.unsqueeze(1)
-
-		elif self.grad_mode == "numerical":
-			eps = self.normal_eps
-			offsets = torch.as_tensor(
-				[
-					[eps, 0.0, 0.0],
-					[-eps, 0.0, 0.0],
-					[0.0, eps, 0.0],
-					[0.0, -eps, 0.0],
-					[0.0, 0.0, eps],
-					[0.0, 0.0, -eps],
-				]
-			).to(x)
-			x_expanded = (x[...,None,:] + offsets).clamp(-1, 1)
-			sdf_values = self.sdf(x_expanded.view(-1, x.shape[-1]), time).view(*x_expanded.shape[:-1])
-			gradients = 0.5 * (sdf_values[..., 0::2] - sdf_values[..., 1::2]) / eps
 
 			return gradients.unsqueeze(1)
 
@@ -353,17 +195,13 @@ class SDFNetwork(nn.Module):
 		else:
 			return self.embed_fn_fine.update(progress)
 
-		alpha = min(progress / self.progressive_until, 1)
-		self.normal_eps = self.init_normal_eps * (1 - alpha) + self.final_normal_eps * alpha
-		print("Updating numerical eps:", self.normal_eps)
-
-
 
 # This implementation is borrowed from IDR: https://github.com/lioryariv/idr
 class RenderingNetwork(nn.Module):
 	def __init__(self,
 				 d_feature,
 				 mode,
+				 d_in,
 				 d_out,
 				 d_hidden,
 				 n_layers,
@@ -384,13 +222,10 @@ class RenderingNetwork(nn.Module):
 		self.render_mode = render_mode
 		pos_dim = 3
 		pos_dim += time_dim
+		d_in += time_dim
 
 		dims_view_independent = [pos_dim + 3 + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
-		dims_view_dependent = [pos_dim + 3 + 3 + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
-
-		if self.mode == 'no_normal':
-			dims_view_independent[0] -= 3
-			dims_view_dependent[0] -= 3
+		dims_view_dependent = [d_in + d_feature] + [d_hidden for _ in range(n_layers)] + [d_out]
 
 		self.embed_fn = None
 		if encoding is not None:
@@ -431,15 +266,14 @@ class RenderingNetwork(nn.Module):
 
 
 	def forward_view_independent(self, points, normals, feature_vectors):
-		if self.embed_fn is not None:
-			points = self.embed_fn(points)
-
 		if self.mode == 'no_normal':
 			rendering_input = torch.cat([points, feature_vectors], dim=-1)
 		else:
 			rendering_input = torch.cat([points, normals, feature_vectors], dim=-1)
 
 		x = rendering_input
+		if self.embed_fn is not None:
+			x = self.embed_fn(x)
 		x = self.view_independent_network(x)
 		if self.squeeze_out:
 			x = torch.sigmoid(x)
@@ -514,27 +348,49 @@ class ProjectionNetwork(nn.Module):
 				 multires_view=0,
 				 encoding_view="default",
 				 pattern_supervision="supervised",
+				 blend_dropout_ratio=0.0,
 				 grayscale=False,
+				 pattern_conv=None,
 				 no_grad=True,
 				 time_dim=0,
-				 rot_sigma=None,
-				 n_images=None,
-				 projection_power=False):
+				 pattern_offset_size=None,
+				 n_images=None):
 		super().__init__()
 		self.mode = mode
 		self.pattern_supervision = pattern_supervision
 		self.grayscale = grayscale
+		self.blend_dropout_ratio = blend_dropout_ratio
 		self.no_grad = no_grad
 		self.pos_dim = 3 + time_dim
 
-		self.nerf_illum_param = nn.Parameter(torch.from_numpy(np.float32([1,1,1e-6])))
-		if rot_sigma is not None:
-			self.rot_sigma = nn.Parameter(torch.from_numpy(np.float32(rot_sigma)))
+		if pattern_conv == "DSC":
+			k = 5
+			self.pattern_conv = torch.nn.Conv2d(3, 3, (k, k), padding='same', groups=3)
+		elif pattern_conv == "DC":
+			assert pattern_offset_size is not None, "pattern_offset_size must be specified when pattern_conv == DC."
+			assert n_images is not None, "n_images must be specified when pattern_conv == DC."
+			k = 5
+			self.pattern_conv = torchvision.ops.DeformConv2d(3, 3, (k, k), padding=(k//2,k//2), groups=3)
+			self.deform_offset = nn.Parameter(torch.zeros((n_images, 2 * k * k, pattern_offset_size[1], pattern_offset_size[0])))
+		elif pattern_conv == "Conv":
+			k = 1
+			self.pattern_conv = SingleConv((k, k), padding='same', bias=False)
 		else:
-			self.rot_sigma = None
+			self.pattern_conv = None
+
+		if self.pattern_conv is not None:
+			torch.nn.init.normal_(self.pattern_conv.weight, mean=0.0, std=1e-4)
+			if self.pattern_conv.bias is not None:
+				torch.nn.init.constant_(self.pattern_conv.bias, 1e-4)
+			with torch.no_grad():
+				self.pattern_conv.weight[:, :, k//2, k//2] = 1.0
+
+		self.nerf_illum_param = nn.Parameter(torch.from_numpy(np.float32([1,1,1e-6])))
 
 #		assert (self.pattern_supervision in ["semisupervised", "unsupervised"] and self.mode in ["implicit", "implicit_w_blend"]) or self.pattern_supervision == "supervised", \
 #			"un/semisupervised projection is only available with implicit!"
+		assert (self.blend_dropout_ratio == 0.0 or self.mode in ["implicit_w_blend", "original", "explicit", "explicit_w_ambient"]), \
+			"blend_dropout_ratio is only effective with blended modes!"
 
 		if self.mode in ["explicit", "explicit_w_ambient"]:
 			dims = [self.pos_dim + d_feature]
@@ -584,11 +440,6 @@ class ProjectionNetwork(nn.Module):
 			layers = self.make_layers(dims, weight_norm)
 			self.implicit_projection_network = nn.Sequential(*layers)
 
-		if projection_power:
-			self.projection_power_params = nn.Parameter(torch.from_numpy(np.float32([1.0, 1e-3, 1e-3])))
-		else:
-			self.projection_power_params = None
-
 
 	def make_layers(self, dims, weight_norm):
 		layers = []
@@ -607,55 +458,31 @@ class ProjectionNetwork(nn.Module):
 		return layers
 
 
-	def prepare_proj_params(self, pts_homo, indices, proj_param, shadow_map, scatter_density=None, scatter_color=None, mode='cam'):
+	def prepare_proj_params(self, pts_homo, indices, proj_param, shadow_map, scatter_density=None, scatter_color=None):
 #		if self.no_grad:
 #			no_grad = torch.no_grad()
 #			no_grad.__enter__()
 
 		proj_mat = proj_param["proj_mat"].to(pts_homo)
-		cam_to_proj_pose = proj_param["proj_pose"].to(pts_homo)
+		proj_pose = proj_param["proj_pose"].to(pts_homo)
 		cam_pose = proj_param["cam_pose"].to(pts_homo)
 		scale_mat = proj_param["scale_mat"].to(pts_homo)
-		proj_pose = cam_to_proj_pose @ cam_pose
-		proj_world_mat = proj_pose @ scale_mat
+		proj_world_mat = torch.matmul(proj_pose, torch.matmul(cam_pose, scale_mat))
 #		proj_world_mat = proj_param["proj_world_mat"].to(pts_homo)
-		pattern = proj_param["pattern"].to(pts_homo)
+		pattern = proj_param["pattern"].to(pts_homo).permute(0,3,1,2)
 
-		proj_pos = -proj_pose[:,:3,3] @ proj_pose[:,:3,:3].transpose(-1,-2)
-		input_dirs = F.normalize(proj_pos[:,None] - pts_homo[...,:3], dim=-1)
+		input_dirs = F.normalize(cam_pose[:,:3,3][:,None] - pts_homo[...,:3], dim=-1)
 
-		pts_homo_trans = torch.matmul(proj_world_mat, pts_homo.transpose(-2,-1)).transpose(-2,-1).reshape(*pts_homo.shape)
+		pts_homo_trans = torch.matmul(proj_world_mat, pts_homo.transpose(1,2)).transpose(1,2).reshape(*pts_homo.shape)
 		pts_trans = pts_homo_trans[...,:3]
 		distance_to_proj = pts_trans[...,2]
 		is_forward = distance_to_proj >= 0
-		if self.projection_power_params is not None:
-			projection_power = is_forward.float() * \
-				(self.projection_power_params[0] + \
-				self.projection_power_params[1] / (distance_to_proj + 1e-6) + \
-				self.projection_power_params[2] / (distance_to_proj ** 2 + 1e-6))
-		else:
-			projection_power = is_forward.float()
 
 		if "refractive_interface" in proj_param:
-			pts_trans = proj_param["refractive_interface"].forward_projection(pts_trans.reshape(-1,3)).view(*pts_trans.shape)
+			pts_trans = proj_param["refractive_interface"].forward_projection(pts_trans.view(-1,3)).view(*pts_trans.shape)
 
 		pts_trans = pts_trans / (distance_to_proj[...,None] + 1e-8)
-
-		# Randomize pts_trans
-		num_samples = 16
-		if self.rot_sigma is not None:
-			B, N, _ = pts_trans.shape
-
-			sigma_rad = self.rot_sigma * torch.pi / 180.0
-			euler_angles = torch.randn(B, num_samples, 3, device=pts_trans.device) * sigma_rad
-
-			rot_mats = euler_angles_to_matrix(euler_angles, convention="ZXY")
-
-			pts_trans_expanded = pts_trans[:, None, :, :]  # [B, 1, N, 3]
-			pts_trans_randomized = torch.matmul(pts_trans_expanded, rot_mats.transpose(-1, -2))  # [B, num_samples, N, 3]
-			pts_trans = pts_trans_randomized.view(B * num_samples, N, 3)
-
-		pts_trans = torch.matmul(proj_mat[...,:3,:3], pts_trans.transpose(-2,-1)).transpose(-2,-1).view(*pts_trans.shape)
+		pts_trans = torch.matmul(proj_mat[...,:3,:3], pts_trans.transpose(1,2)).transpose(1,2).view(*pts_trans.shape)
 
 		# Interpolation
 		pts_trans[...,0] = pts_trans[...,0] / pattern.shape[-1] * 2 - 1
@@ -664,13 +491,16 @@ class ProjectionNetwork(nn.Module):
 #		if self.no_grad:
 #			no_grad.__exit__(None, None, None)
 
-		projected_color = F.grid_sample(pattern.expand(len(pts_trans), *pattern.shape[1:]), pts_trans[...,:2].unsqueeze(1))	# [B, C, N] or [B * num_samples, C, N]
+		if self.pattern_conv is not None:
+			if isinstance(self.pattern_conv, torchvision.ops.DeformConv2d):
+#				positional_embed = create_positional_encoding(pattern.shape[-1], pattern.shape[-2]).unsqueeze(0).to(pattern)
+				resized_offset = F.interpolate(self.deform_offset[indices][None], size=(pattern.shape[-2], pattern.shape[-1]), mode='nearest')
+				pattern = self.pattern_conv(pattern, resized_offset)
+			else:
+				pattern = self.pattern_conv(pattern)
 
-		if self.rot_sigma is not None:
-			projected_color = projected_color.view(B, num_samples, pattern.shape[1], 1, N) # [B, num_samples, C, N]
-			projected_color = projected_color.mean(dim=1)  # [B, C, 1, N]
-
-		projected_color = projected_color[:,:,0].transpose(-1,-2) * projection_power[...,None]
+		projected_color = F.grid_sample(pattern.expand(len(pts_trans), *pattern.shape[1:]), pts_trans[...,:2].unsqueeze(1))
+		projected_color = projected_color[:,:,0].transpose(-1,-2) * is_forward[...,None]
 
 		# Attenuation
 		if scatter_density is not None and scatter_color is not None:
@@ -680,16 +510,16 @@ class ProjectionNetwork(nn.Module):
 
 		if self.pattern_supervision == "semisupervised":
 			projected_color = torch.cat([self.embedpattern_fn(pts_trans[...,:2].reshape(-1,2)), projected_color], dim=-1)
-			if self.mode in ["original", "explicit", "explicit_w_ambient", "turbosl"]:
+			if self.mode in ["original", "explicit", "explicit_w_ambient"]:
 				projected_color = self.pattern_decoder(projected_color)
 		elif self.pattern_supervision == "weaksupervised":
-			if self.mode in ["original", "explicit", "explicit_w_ambient", "turbosl"]:
+			if self.mode in ["original", "explicit", "explicit_w_ambient"]:
 				projected_color = projected_color + self.pattern_decoder(self.embedpattern_fn(pts_trans[...,:2].reshape(-1,2)))
 			else:
 				projected_color = torch.cat([self.embedpattern_fn(pts_trans[...,:2].reshape(-1,2)), projected_color], dim=-1)
 		elif self.pattern_supervision == "unsupervised":
 			projected_color = self.embedpattern_fn(pts_trans[...,:2].reshape(-1,2))
-			if self.mode in ["original", "explicit", "explicit_w_ambient", "turbosl"]:
+			if self.mode in ["original", "explicit", "explicit_w_ambient"]:
 				projected_color = self.pattern_decoder(projected_color)
 
 		if shadow_map is not None:
@@ -699,10 +529,8 @@ class ProjectionNetwork(nn.Module):
 
 
 	def forward(self, points, points_timed, indices, normals, view_dirs, feature_vectors, proj_params, color_network, illum_params, 
-		shadow_maps=None, wo_pattern=False, scatter_density=None, scatter_color=None, mode='cam'):
+		shadow_maps=None, wo_pattern=False, scatter_density=None, scatter_color=None):
 		projected_colors = []
-		reference_color = []
-		pts_trans_list = []
 		pts_homo = torch.cat([points, torch.ones_like(points[...,:1]).to(points)], dim=-1)
 
 		if normals is not None:
@@ -710,47 +538,30 @@ class ProjectionNetwork(nn.Module):
 
 		for pi, proj_param in enumerate(proj_params):
 			input_dirs, projected_color, pts_trans = self.prepare_proj_params(pts_homo, indices, proj_param,
-				shadow_maps[pi] if shadow_maps is not None else None, scatter_density, scatter_color, mode)
-			pts_trans_list.append(pts_trans)
+				shadow_maps[pi] if shadow_maps is not None else None, scatter_density, scatter_color)
 
-			if self.mode in ["original", "turbosl_flat"]:
-				if mode == 'cam':
-					projected_colors.append(projected_color)
-				else:
-					projected_colors.append(torch.ones_like(input_dirs.view(-1,3)))
-					reference_color.append(projected_color)
-
-			elif self.mode in ["turbosl", "turbosl_no_ambient", "turbosl_illum"]:
-				input_dirs_ = input_dirs.view(-1,3)
-				dot = -(input_dirs_ * normals).sum(dim=-1)[...,None]
-				if mode == 'cam':
-					projected_colors.append(projected_color * dot)
-				else:
-					projected_colors.append(dot)
-					reference_color.append(projected_color)
+			if self.mode == "original":
+				projected_colors.append(projected_color)
 
 			elif self.mode in ["explicit", "explicit_w_ambient"]:
-				points_ = points_timed.reshape(-1,self.pos_dim)
+				points_timed = points_timed.reshape(-1,self.pos_dim)
 				input_dirs_ = input_dirs.view(-1,3)
 				if self.embed_fn is not None:
-					points_ = self.embed_fn(points_)
+					points_timed = self.embed_fn(points_timed)
 
-				x = torch.cat([points_, feature_vectors], dim=-1)
+				x = torch.cat([points_timed, feature_vectors], dim=-1)
 				x = self.explicit_projection_network(x)
-				dot = (input_dirs_ * normals).sum(dim=-1)[...,None]
+				reflectance_ratio, roughness = x[...,0], x[...,1]
+				reflectance_ratio = torch.sigmoid(reflectance_ratio)[...,None]
+#				roughness = F.relu(roughness)
 
-				if mode == 'cam':
-					reflectance_ratio, roughness = x[...,0], x[...,1]
-					reflectance_ratio = torch.sigmoid(reflectance_ratio)[...,None]
-	#				roughness = F.relu(roughness)
-	#				reflection_vector = 2 * normals * dot - input_dirs_
-					color_lambert = (1 - reflectance_ratio) * projected_color * dot
-					color_emissive = reflectance_ratio * projected_color
-	#				color_specular = reflectance_ratio * projected_color * (F.relu((view_dirs * reflection_vector).sum(dim=-1)) ** roughness)[...,None]
-	#				projected_colors.append(color_lambert + color_specular)
-					projected_colors.append(color_lambert + color_emissive)
-				else:
-					raise NotImplementedError
+				dot = (input_dirs_ * normals).sum(dim=-1)[...,None]
+#				reflection_vector = 2 * normals * dot - input_dirs_
+				color_lambert = (1 - reflectance_ratio) * projected_color * dot
+				color_emissive = reflectance_ratio * projected_color
+#				color_specular = reflectance_ratio * projected_color * (F.relu((view_dirs * reflection_vector).sum(dim=-1)) ** roughness)[...,None]
+#				projected_colors.append(color_lambert + color_specular)
+				projected_colors.append(color_lambert + color_emissive)
 
 			elif self.mode in ["implicit", "implicit_w_blend"]:
 				# Input
@@ -772,65 +583,40 @@ class ProjectionNetwork(nn.Module):
 				else:
 					shadow_map = shadow_maps[pi][...,None]
 
-				if mode == 'cam':
-					x = torch.cat([points_, view_dirs_, normals, feature_vectors, projected_color * (0 if wo_pattern else 1), input_dirs_, shadow_map], dim=-1)	
-					x = self.implicit_projection_network(x)
-					x = torch.sigmoid(x)
-					projected_colors.append(x)
-				else:
-					raise NotImplementedError
+				x = torch.cat([points_, view_dirs_, normals, feature_vectors, projected_color * (0 if wo_pattern else 1), input_dirs_, shadow_map], dim=-1)	
+				x = self.implicit_projection_network(x)
+				x = torch.sigmoid(x)
+
+				projected_colors.append(x)
 
 			else:
 				raise NotImplementedError()
 
 		projected_colors = torch.stack(projected_colors).sum(dim=0)
-		if len(reference_color) > 0:
-			reference_color = torch.stack(reference_color).mean(dim=0)
 		if self.mode == "explicit_w_ambient":
 			projected_colors += self.ambient_bias
 
 		if self.grayscale:
 			projected_colors = projected_colors.mean(dim=-1, keepdim=True)
 
-		if self.mode in ["original", "explicit", "explicit_w_ambient", "implicit_w_blend", "turbosl", "turbosl_flat", "turbosl_no_ambient", "turbosl_illum"]:
-			return self.blend(points_timed, normals, view_dirs, feature_vectors, 
-				illum_params, color_network, projected_colors, wo_pattern, mode, reference_color), pts_trans_list
+		if self.mode in ["original", "explicit", "explicit_w_ambient", "implicit_w_blend"]:
+			return self.blend(points_timed, normals, view_dirs, feature_vectors, illum_params, color_network, projected_colors, wo_pattern)
 		elif self.mode in ["implicit", "implicit_wo_feature", "implicit_only_feature"]:
-			return projected_colors, pts_trans_list
+			return projected_colors
 		else:
 			raise NotImplementedError()
 
 
-	def blend(self, points, normals, view_dirs, feature_vectors, illum_params, color_network, projected_colors, wo_pattern=False, 
-		mode='cam', reference_color=None):
-		assert mode != 'proj' or reference_color is not None, "reference_color is required for projector rendering"
-
+	def blend(self, points, normals, view_dirs, feature_vectors, illum_params, color_network, projected_colors, wo_pattern=False):
 		sampled_color = color_network(points.reshape(-1,self.pos_dim), normals, view_dirs, feature_vectors)
 		if sampled_color.shape[-1] == 1:
 			projected_colors = projected_colors.mean(dim=-1, keepdims=True)
-
+		if self.blend_dropout_ratio > 0 and np.random.rand() < self.blend_dropout_ratio:
+			# Technique to avoid no grad problem
+			return sampled_color * illum_params["ambient"] + (sampled_color * illum_params["diffuse"] * 0 + illum_params["emissive"] * 0) * projected_colors
 		if not wo_pattern:
-			if self.mode in ["turbosl", "turbosl_flat"]:
-				ambient = sampled_color[...,:3]
-				reflectance = sampled_color[...,3:]
-			elif self.mode == "turbosl_no_ambient":
-				ambient = torch.zeros_like(sampled_color[...,:3])
-				reflectance = sampled_color[...,3:]
-			elif self.mode == "turbosl_illum":
-				ambient = sampled_color * illum_params["ambient"]
-				reflectance = sampled_color * illum_params["diffuse"] + illum_params["emissive"]
-			else:
-				ambient = sampled_color * illum_params["ambient"]
-				reflectance = sampled_color * illum_params["diffuse"] + illum_params["emissive"]
-
-			if mode == 'cam':
-				sampled_color = ambient + reflectance * projected_colors
-			elif mode == 'proj':
-				illuminated_color = reference_color - ambient
-				sampled_color = illuminated_color / (torch.maximum(reflectance * projected_colors, illuminated_color) + 1e-5)
-			else:
-				raise NotImplementedError
-
+			sampled_color = sampled_color * illum_params["ambient"] + \
+			(sampled_color * illum_params["diffuse"] + illum_params["emissive"]) * projected_colors
 		return sampled_color
 
 
@@ -839,8 +625,7 @@ class ProjectionNetwork(nn.Module):
 		pts_homo = torch.cat([points, torch.ones_like(points[...,:1]).to(points)], dim=-1)
 
 		for pi, proj_param in enumerate(proj_params):
-			_, projected_color, _ = self.prepare_proj_params(pts_homo, indices, proj_param,
-				None, scatter_density, scatter_color)
+			_, projected_color, _ = self.prepare_proj_params(pts_homo, proj_param, indices, None, scatter_density, scatter_color)
 			projected_colors.append(projected_color)
 
 		projected_colors = torch.stack(projected_colors).sum(dim=0)
@@ -984,7 +769,7 @@ class TimeEmbedding(nn.Module):
 		return nn.Sequential(*layers[:-1])
 
 
-	def forward(self, x_static, x_dynamic, t : int):
+	def forward(self, x_static, x_dynamic, t : int, is_reference_frame=False):
 		t_ = t / self.max_time
 
 		feature_list = [self.static_mlp(x_static)]
@@ -1003,6 +788,9 @@ class TimeEmbedding(nn.Module):
 			else:
 				v_d = self.dynamic_mlps["%d_%d" % (l, mlp_index)](input_to_dynamic)
 
+			if is_reference_frame:
+				v_d = v_d.detach()
+
 			feature_list.append(v_d)
 
 		return torch.cat(feature_list, dim=-1)
@@ -1018,7 +806,7 @@ class TimeEmbeddingGrid(nn.Module):
 		self.total_dim = self.pos_dim + self.time_dim
 
 
-	def forward(self, x_static, x_dynamic, t : int):
+	def forward(self, x_static, x_dynamic, t : int, is_reference_frame=False):
 		return torch.cat([x_static, x_dynamic], dim=-1)
 
 
@@ -1055,10 +843,13 @@ class TimeEmbeddingCascade(nn.Module):
 		return nn.Sequential(*layers[:-1])
 
 
-	def forward(self, x_static, x_dynamic, t : int):
+	def forward(self, x_static, x_dynamic, t : int, is_reference_frame=False):
 		t_ = t / self.max_time
 
 		x_static = self.static_mlp(x_static)
+
+		if is_reference_frame:
+			return x_static
 
 		input_to_dynamic = torch.cat([x_static, x_dynamic], dim=-1)
 
@@ -1425,80 +1216,3 @@ class DeformNetworkRigid(nn.Module):
 		transformed = torch.matmul(R, inputs[:,:3,None])[...,0] + T
 		return transformed
 
-
-# @title Define SIREN deformation model
-class SineLayer(nn.Module):
-	# See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of omega_0.
-
-	# If is_first=True, omega_0 is a frequency factor which simply multiplies the activations before the
-	# nonlinearity. Different signals may require different omega_0 in the first layer - this is a
-	# hyperparameter.
-
-	# If is_first=False, then the weights will be divided by omega_0 so as to keep the magnitude of
-	# activations constant, but boost gradients to the weight matrix (see supplement Sec. 1.5)
-
-	def __init__(self, in_features, out_features, bias=True,
-				 is_first=False, omega_0=30):
-		super().__init__()
-		self.omega_0 = omega_0
-		self.is_first = is_first
-
-		self.in_features = in_features
-		self.linear = nn.Linear(in_features, out_features, bias=bias)
-
-		self.init_weights()
-
-	def init_weights(self):
-		with torch.no_grad():
-			if self.is_first:
-				self.linear.weight.uniform_(-1 / self.in_features,
-											 1 / self.in_features)
-			else:
-				self.linear.weight.uniform_(-np.sqrt(6 / self.in_features) / self.omega_0,
-											 np.sqrt(6 / self.in_features) / self.omega_0)
-
-	def forward(self, input):
-		return torch.sin(self.omega_0 * self.linear(input))
-
-
-	def forward_with_intermediate(self, input):
-		# For visualization of activation distributions
-		intermediate = self.omega_0 * self.linear(input)
-		return torch.sin(intermediate), intermediate
-
-
-
-class DeformNetworkSiren(nn.Module):
-	def __init__(self,
-				 d_hidden=128,
-				 n_layers=3,
-				 first_omega_0=30,
-				 hidden_omega_0=30,
-		):
-		super().__init__()
-
-		transform_dim = 3
-
-		self.net = []
-		self.net.append(SineLayer(transform_dim + 1, d_hidden,
-								  is_first=True, omega_0=first_omega_0))# The first nn.Linear() layer
-
-		for i in range(n_layers):# The hidden layers
-			self.net.append(SineLayer(d_hidden, d_hidden,
-									  is_first=False, omega_0=hidden_omega_0))
-
-		final_linear = nn.Linear(d_hidden, transform_dim)
-
-		with torch.no_grad():
-			final_linear.weight.uniform_(-np.sqrt(6 / d_hidden) / hidden_omega_0,
-										  np.sqrt(6 / d_hidden) / hidden_omega_0)
-
-		self.net.append(final_linear)
-
-		self.net = nn.Sequential(*self.net)
-
-
-	def forward(self, inputs):
-		x = inputs
-		x = self.net(x)
-		return inputs[...,:3] + x * (inputs[...,3:] > 0).float()

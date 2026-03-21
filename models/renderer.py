@@ -5,7 +5,6 @@ import numpy as np
 import logging
 import mcubes
 from icecream import ic
-#from nerfacc import render_weight_from_alpha, accumulate_along_rays
 
 
 def extract_fields(bound_min, bound_max, resolution, query_func, flat_axis):
@@ -114,7 +113,6 @@ def unimodality_loss(alpha, transmittance, eps=1e-6):
 
 
 def compute_weights(alpha):
-#	weights, transmittance = render_weight_from_alpha(alpha)
 	transmittance = torch.cumprod(torch.cat([torch.ones([alpha.shape[0], 1]), 1. - alpha + 1e-7], -1), -1)[:, :-1]
 	weights = alpha * transmittance
 	return weights, transmittance
@@ -169,13 +167,11 @@ class NeuSRenderer:
 				 wo_pattern=False,
 				 shadow_volume_mode="weights",
 				 density_mode="sdf",
-				 geometry_threshold=None,
 				 sdf_type="neus",
 				 outside_dropout_ratio=0.0,
 				 input_time=False,
 				 time_gradient_type=None,
-				 curvature_cap=None,
-				 sampler_mode="uniform"):
+				 curvature_cap=None):
 		self.n_images = n_images
 		self.nerf = nerf
 		self.sdf_network = sdf_network
@@ -210,14 +206,6 @@ class NeuSRenderer:
 			self.pos_dim += 1
 		self.time_gradient_type = time_gradient_type
 		self.curvature_cap = curvature_cap
-		self.sampler_mode = sampler_mode
-		if geometry_threshold is not None:
-			self.geometry_threshold = geometry_threshold
-		else:
-			if self.density_mode == "sdf":
-				self.geometry_threshold = 0.0
-			else:
-				self.geometry_threshold = 0.5
 
 
 	def to_timed_pts(self, pts, indices):
@@ -410,7 +398,8 @@ class NeuSRenderer:
 					deviation_network,
 					cos_anneal_ratio=0.0,
 					sharpness_coeff=10,
-					compute_curvature_loss=False):
+					compute_curvature_loss=False,
+					is_reference_frame=False):
 			batch_size, n_samples = z_vals.shape
 
 			# Section length
@@ -421,14 +410,14 @@ class NeuSRenderer:
 			# Section midpoints
 			pts = rays_o[:, None, :] + rays_d[:, None, :] * mid_z_vals[..., :, None]  # n_rays, n_samples, 3
 			dirs = rays_d[:, None, :].expand(pts.shape)
-#			dirs = dirs * z_vals[...,np.newaxis]
+			dirs = dirs * z_vals[...,np.newaxis]
 
 			pts = self.to_timed_pts(pts, indices)
 			pts = pts.reshape(-1, self.pos_dim)
 			dirs = dirs.reshape(-1, 3)
-#			dirs = F.normalize(dirs, dim=-1)
+			dirs = F.normalize(dirs, dim=-1)
 
-			sdf_nn_output = sdf_network(pts, indices)
+			sdf_nn_output = sdf_network(pts, indices, is_reference_frame=is_reference_frame)
 			sdf = sdf_nn_output[:, :1]
 			feature_vector = sdf_nn_output[:, 1:]
 
@@ -437,18 +426,18 @@ class NeuSRenderer:
 
 			if self.density_mode in ["nerf", "hybrid"]:
 				alpha = 1.0 - torch.exp(-F.softplus(-sdf * self.nerf_coef) * dists.reshape(-1, 1)).reshape(batch_size, n_samples)
-				gradients_all = sdf_network.gradient(pts, indices, compute_hessian=False, sdf=sdf)
+				gradients_all = sdf_network.gradient(pts, indices, compute_hessian=False)
 				gradients = gradients_all.squeeze()[...,:3]
 				hessians_all = None
 				hessians = None
 
 			if self.density_mode in ["sdf", "hybrid"]:
 				if compute_curvature_loss:
-					gradients_all, hessians_all = sdf_network.gradient(pts, indices, compute_hessian=True, sdf=sdf)
+					gradients_all, hessians_all = sdf_network.gradient(pts, indices, compute_hessian=True)
 					gradients = gradients_all.squeeze()[...,:3]
 					hessians = hessians_all.squeeze()[...,:3]
 				else:
-					gradients_all = sdf_network.gradient(pts, indices, compute_hessian=False, sdf=sdf)
+					gradients_all = sdf_network.gradient(pts, indices, compute_hessian=False)
 					gradients = gradients_all.squeeze()[...,:3]
 					hessians_all = None
 					hessians = None
@@ -528,12 +517,12 @@ class NeuSRenderer:
 					shadow_field_ratio=False,
 					disable_shadow=False,
 					visualize_shadow=False,
-					mode='cam'):
+					is_reference_frame=False):
 
 		batch_size, n_samples = z_vals.shape
 		pts, dirs, dists, sdf, feature_vector, foreground_alpha, gradients, gradients_time, hessians, hessians_time, inv_s = \
 			self.ray_marching(rays_o, rays_d, indices, z_vals, sdf_network, 
-								deviation_network, cos_anneal_ratio, sharpness_coeff, compute_curvature_loss)
+								deviation_network, cos_anneal_ratio, sharpness_coeff, compute_curvature_loss, is_reference_frame)
 		pts_norm = torch.linalg.norm(pts, ord=2, dim=-1, keepdim=True).reshape(batch_size, n_samples)
 		inside_sphere = (pts_norm < 1.0).float().detach()
 		relax_inside_sphere = (pts_norm < 1.2).float().detach()
@@ -622,15 +611,14 @@ class NeuSRenderer:
 				background_density_ = None
 				background_sampled_color_ = None
 
-			sampled_color, reprojection_coords = self.projection_network(pts.view(batch_size, n_samples, 3), self.to_timed_pts(pts, indices), indices,
-																		gradients, dirs, feature_vector, proj_params,
-																		color_network, illum_params, shadow_maps if not disable_shadow else None, 
-																		self.wo_pattern, background_density_, background_sampled_color_, mode=mode)
+			sampled_color = self.projection_network(pts.view(batch_size, n_samples, 3), self.to_timed_pts(pts, indices), indices,
+														gradients, dirs, feature_vector, proj_params,
+														color_network, illum_params, shadow_maps if not disable_shadow else None, 
+														self.wo_pattern, background_density_, background_sampled_color_)
 			sampled_color = sampled_color.reshape(batch_size, n_samples, -1)
 		else:
 			pts = self.to_timed_pts(pts, indices)
 			sampled_color = color_network(pts, gradients, dirs, feature_vector).reshape(batch_size, n_samples, -1)
-			reprojection_coords = None
 
 
 		# Render with background
@@ -663,7 +651,6 @@ class NeuSRenderer:
 			alpha_solid = foreground_alpha
 
 		mask_weights, transmittance = compute_weights(alpha)
-#		color = accumulate_along_rays(mask_weights, sampled_color)
 		color = (sampled_color * mask_weights[:, :, None]).sum(dim=1)
 
 		if self.allow_volume_scattering or self.allow_subsurface_scattering:
@@ -673,7 +660,6 @@ class NeuSRenderer:
 			mask_weights_solid = mask_weights
 
 		weights_sum = mask_weights.sum(dim=-1, keepdim=True)
-#		weights_sum = accumulate_along_rays(mask_weights, None)
 		if background_rgb is not None:    # Fixed background, usually black
 			color = color + background_rgb * (1.0 - weights_sum)
 
@@ -707,24 +693,10 @@ class NeuSRenderer:
 #			sdf_next = sdf_network.sdf(self.to_timed_pts(pts, indices + 0.5), indices + 0.5)
 #			temporal_smoothness_error = (((sdf_prev + sdf_next) / 2 - sdf) ** 2).mean()
 
-#			num_random_points = 1000	# N
-			steps = 10					# M
-#			random_pts = torch.empty(num_random_points, 3).uniform_(-1, 1).to(pts)
-			linear_indices = torch.linspace(0, 1, steps).to(pts)
-			random_pts = pts[:,None].repeat(1, steps, 1)
-			linear_indices = linear_indices[None,:,None].repeat(len(pts), 1, 1)
-
-			random_sdf = sdf_network.sdf(
-				self.to_timed_pts(random_pts.view(-1,3), linear_indices.view(-1,1)), 
-				linear_indices.view(-1,1)).view(len(pts), steps)
-
-			differences = random_sdf[:, 1:] - random_sdf[:, :-1]
-			expected_difference = (random_sdf[:, -1] - random_sdf[:, 0]) / (steps - 1)
-			temporal_smoothness_error = torch.mean((differences - expected_difference.unsqueeze(-1)) ** 2)
-
-#			random_indices = torch.empty(10000, 1).uniform_(0, 1).to(pts)
-#			gradients_all = sdf_network.gradient(self.to_timed_pts(random_pts, random_indices), random_indices, compute_hessian=False)
-#			temporal_smoothness_error = gradients_all[...,3:].abs().mean()
+			random_pts = torch.empty(10000, 3).uniform_(-1, 1).to(pts)
+			random_indices = torch.empty(10000, 1).uniform_(0, 1).to(pts)
+			gradients_all = sdf_network.gradient(self.to_timed_pts(random_pts, random_indices), random_indices, compute_hessian=False)
+			temporal_smoothness_error = gradients_all[...,3:].abs().mean()
 		else:
 			temporal_smoothness_error = 0
 
@@ -736,20 +708,11 @@ class NeuSRenderer:
 			shadow_maps = (torch.stack(shadow_maps).mean(dim=0).view(batch_size, n_samples) * mask_weights[:,:n_samples]).sum(dim=1)
 			color = torch.ones_like(color) * shadow_maps[:,None] + (1.0 - weights_sum) * 0.5
 
-		# Compute depth
-		depth = (mask_weights[:,:n_samples] / weights_sum * z_vals).sum(dim=-1)
-
-		# Compute reprojection coords
-		if reprojection_coords is not None:
-			reprojection_coords = [((mask_weights[:,:n_samples] / weights_sum)[...,None] * coord).sum(dim=-1) for coord in reprojection_coords]
-
 		return {
 			'color': color,
 			'sdf': sdf,
 			'pts': pts,
 			'dists': dists,
-			'depth': depth,
-			'reprojection_coords': reprojection_coords,
 			'gradients': gradients,
 			'gradients_time': gradients_time,
 			's_val': 1.0 / inv_s,
@@ -767,15 +730,10 @@ class NeuSRenderer:
 
 	def render(self, rays_o, rays_d, indices, near, far, perturb_overwrite=-1, background_rgb=None, cos_anneal_ratio=0.0, 
 		proj_params=[], illum_params=None, compute_curvature_loss=False, compute_temporal_smoothness_error=False, 
-		shadow_field_ratio=False, disable_shadow=False, visualize_shadow=False, mode='cam'):
+		shadow_field_ratio=False, disable_shadow=False, visualize_shadow=False):
 		batch_size = len(rays_o)
 		sample_dist = 2.0 / self.n_samples   # Assuming the region of interest is a unit sphere
-		if self.sampler_mode == 'uniform':
-			z_vals = torch.linspace(0.0, 1.0, self.n_samples)
-		elif self.sampler_mode == 'piecewise':
-			z_vals = torch.cat([torch.linspace(0.0, 0.25, self.n_samples // 2), 1 / (4 - torch.linspace(0.0, 1.0, self.n_samples // 2) * 3)])
-		else:
-			raise NotImplementedError
+		z_vals = torch.linspace(0.0, 1.0, self.n_samples)
 		z_vals = near + (far - near) * z_vals[None, :]
 
 		compute_outside = (self.n_outside > 0 or self.allow_subsurface_scattering or self.allow_volume_scattering) and (np.random.rand() >= self.outside_dropout_ratio)
@@ -836,14 +794,14 @@ class NeuSRenderer:
 			compute_temporal_smoothness_error=compute_temporal_smoothness_error,
 			shadow_field_ratio=shadow_field_ratio,
 			disable_shadow=disable_shadow,
-			visualize_shadow=visualize_shadow,
-			mode=mode,
+			visualize_shadow=visualize_shadow
 		)
 
 		if isinstance(indices, torch.Tensor):
 			indices = int(indices.item())
 		ret_fine = self.render_core(rays_o,	rays_d, indices, z_vals, sample_dist, 
-									self.sdf_network, self.deviation_network, self.color_network, **render_args)
+									self.sdf_network, self.deviation_network, self.color_network, 
+									is_reference_frame=is_reference_frame, **render_args)
 
 		color_fine = ret_fine['color']
 		weights = ret_fine['weights']
@@ -866,8 +824,6 @@ class NeuSRenderer:
 			'visibility': visibility,
 			'sdf': ret_fine['sdf'],
 			'pts': ret_fine['pts'],
-			'depth': ret_fine['depth'],
-			'reprojection_coords': ret_fine['reprojection_coords'],
 			'gradient_error': ret_fine['gradient_error'],
 			'curvature_error': ret_fine['curvature_error'],
 			'unimodality_error': ret_fine['unimodality_error'],
@@ -883,10 +839,10 @@ class NeuSRenderer:
 		return extract_fields(bound_min,
 							bound_max,
 							resolution=resolution,
-							query_func=lambda pts: self.sdf_network.sdf(self.to_timed_pts(pts, 0), 0) * (-1 if self.density_mode == "sdf" else 1),
+							query_func=lambda pts: -self.sdf_network.sdf(self.to_timed_pts(pts, 0), 0),
 							flat_axis=swap_time_axis if swap_time_axis is not None else 0)
 
-	def extract_geometry(self, bound_min, bound_max, resolution, time=0, swap_time_axis=None, mass_center=None):
+	def extract_geometry(self, bound_min, bound_max, resolution, threshold=0.0, time=0, swap_time_axis=None):
 		network = self.sdf_network
 
 		def query_func(pts):
@@ -896,15 +852,12 @@ class NeuSRenderer:
 				pts[...,swap_time_axis] = 0
 			else:
 				time_ = time
-			if mass_center is not None:
-				pts += mass_center
-
-			return network.sdf(self.to_timed_pts(pts, time_), time_) * (-1 if self.density_mode == "sdf" else 1)
+			return -network.sdf(self.to_timed_pts(pts, time_), time_)
 
 		return extract_geometry(bound_min,
 								bound_max,
 								resolution=resolution,
-								threshold=self.geometry_threshold,
+								threshold=threshold,
 								query_func=query_func,
 								flat_axis=swap_time_axis if swap_time_axis is not None else 0)
 
