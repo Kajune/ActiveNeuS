@@ -25,4 +25,4 @@ function run_neus() {
 
 
 base_dir=sample_scene
-run_neus activeneus ./confs/oneshot_active.conf ${base_dir} 1 0 --estimate_illum --resume
+run_neus activeneus ./confs/oneshot_active.conf ${base_dir} 36 0 --estimate_illum --resume

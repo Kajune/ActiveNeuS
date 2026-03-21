@@ -801,7 +801,7 @@ class NeuSRenderer:
 			indices = int(indices.item())
 		ret_fine = self.render_core(rays_o,	rays_d, indices, z_vals, sample_dist, 
 									self.sdf_network, self.deviation_network, self.color_network, 
-									is_reference_frame=is_reference_frame, **render_args)
+									is_reference_frame=False, **render_args)
 
 		color_fine = ret_fine['color']
 		weights = ret_fine['weights']

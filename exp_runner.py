@@ -1251,7 +1251,6 @@ if __name__ == '__main__':
 	else:
 		illum_params = None
 
-	torch.cuda.set_device(args.gpu)
 	runner = Runner(args.conf, args.mode, args.exp_name, args.case, args.load, args.load_metadata, args.load_params, args.resume,
 		num_images=args.num_images, num_images_incremental=args.num_images_incremental, num_images_incremental_start=args.num_images_incremental_start,
 		image_ind_offset=args.image_ind_offset, dynamic=args.dynamic,
